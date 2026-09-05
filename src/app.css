@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface-950: #0b0d12;
+  --color-surface-900: #11141b;
+  --color-surface-850: #161a24;
+  --color-surface-800: #1c2130;
+  --color-surface-700: #272e40;
+  --color-surface-600: #3a435a;
+  --color-surface-400: #8b95ad;
+  --color-surface-300: #b4bcd0;
+  --color-surface-100: #e8ebf2;
+  --color-accent-400: #4ade80;
+  --color-accent-500: #22c55e;
+  --color-accent-600: #16a34a;
+  --color-success-400: #34d399;
+  --color-warning-400: #fbbf24;
+  --color-danger-400: #f87171;
+  --font-sans: "Inter", "SF Pro Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: var(--color-surface-950);
+  color: var(--color-surface-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-surface-700);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-surface-600);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+input[type="text"],
+input[type="search"],
+input[type="url"],
+textarea {
+  color-scheme: dark;
+}

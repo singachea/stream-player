@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        width: 360px;
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #11141b;
+        color: #e8ebf2;
+      }
+      header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 10px 12px 8px;
+        border-bottom: 1px solid #272e40;
+      }
+      h1 {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      #status {
+        color: #8b95ad;
+        font-size: 11px;
+      }
+      #list {
+        max-height: 420px;
+        overflow: auto;
+      }
+      .empty {
+        padding: 16px 12px;
+        color: #8b95ad;
+      }
+      .item {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        padding: 8px 12px;
+        border-bottom: 1px solid #1c2130;
+      }
+      .meta {
+        min-width: 0;
+        flex: 1;
+      }
+      .name {
+        font-family: ui-monospace, "SF Mono", monospace;
+        font-size: 12px;
+        word-break: break-all;
+      }
+      .sub {
+        margin-top: 2px;
+        color: #8b95ad;
+        font-size: 11px;
+        word-break: break-all;
+      }
+      button.send {
+        flex-shrink: 0;
+        border: 0;
+        border-radius: 6px;
+        background: #16a34a;
+        color: #fff;
+        font-weight: 600;
+        font-size: 12px;
+        padding: 6px 8px;
+        cursor: pointer;
+      }
+      button.send:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .err {
+        color: #f87171;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Send to Play</h1>
+      <div id="status">Watching…</div>
+    </header>
+    <div id="list"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>
