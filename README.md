@@ -1,5 +1,9 @@
 # Play
 
+<p align="center">
+  <img src="docs/play.jpg" alt="Play — HLS in VLC, with seeking" width="900">
+</p>
+
 Desktop app and CLI to play HLS/HTTP URLs in VLC with seeking. Adds Referer/User-Agent from the URL host, unwraps disguised segments (`.txt` playlists, PNG/JPEG-wrapped MPEG-TS), and serves a local VOD playlist VLC can scrub.
 
 Built with **Tauri 2**, **SvelteKit**, **TypeScript**, **Tailwind CSS**, and a **Rust** engine (same stack as Music Tags).
