@@ -19,6 +19,7 @@
   import RefererDialog from "$lib/components/RefererDialog.svelte";
   import DebugLog from "$lib/components/DebugLog.svelte";
   import JobsPane from "$lib/components/JobsPane.svelte";
+  import StreamsPane from "$lib/components/StreamsPane.svelte";
 
   let url = $state("");
   let referer = $state("");
@@ -32,11 +33,16 @@
   let kind = $state("hls");
   let hosts = $state<HostRow[]>([]);
   let busy = $state(false);
+  let playingOp = $state<"play" | null>(null);
+  let playStage = $state("");
+  let playDone = $state(0);
+  let playTotal = $state(1);
   let resolving = $state(false);
   let playing = $state(false);
   let extraCount = $state(0);
   let playMenu = $state(false);
   let jobs = $state<Job[]>([]);
+  let streams = $state<api.StreamSession[]>([]);
   let needReferer = $state<NeedReferer | null>(null);
   let pendingAfterReferer = $state<"resolve" | "play" | "download" | null>(
     null,
@@ -60,7 +66,11 @@
     ).length,
   );
 
-  const canAct = $derived(!!cleanUrl(url) && !busy);
+  const canPlay = $derived(!!cleanUrl(url) && playingOp === null);
+  const playPct = $derived(
+    playingOp === null ? 0 : Math.min(100, Math.round((playDone / Math.max(1, playTotal)) * 100)),
+  );
+  const playStageLabel = $derived(playStage || "Preparing");
   const headers = $derived.by(() => {
     const ref = referer.trim() || null;
     let orig = origin.trim() || null;
@@ -211,6 +221,15 @@
         typeof pid === "number" ? pid : undefined,
       );
     }).then((u) => unsubs.push(u));
+    void listen<{ stage: string; stageKey: string; done: number; total: number }>(
+      "play-progress",
+      (e) => {
+        if (playingOp === null) return;
+        playStage = e.payload.stage || e.payload.stageKey;
+        playDone = e.payload.done;
+        playTotal = Math.max(1, e.payload.total);
+      },
+    ).then((u) => unsubs.push(u));
     void listen<Job>("job-updated", (e) => {
       const j = e.payload;
       if (!j?.id) return;
@@ -234,6 +253,19 @@
     void api.listJobs().then((list) => {
       jobs = list;
     }).catch(() => {});
+    void api.listStreams().then((list) => {
+      streams = list;
+    }).catch(() => {});
+    void listen<api.StreamSession>("stream-updated", (e) => {
+      const s = e.payload;
+      if (s?.id == null) return;
+      const i = streams.findIndex((x) => x.id === s.id);
+      if (i < 0) streams = [...streams, s];
+      else streams = streams.map((x, k) => (k === i ? s : x));
+    }).then((u) => unsubs.push(u));
+    void listen<number>("stream-removed", (e) => {
+      streams = streams.filter((x) => x.id !== e.payload);
+    }).then((u) => unsubs.push(u));
     void listen<api.ParsedCurl>("play-open", (e) => {
       const cap = e.payload;
       if (!cap?.url) return;
@@ -247,6 +279,7 @@
     }
     window.addEventListener("focus", onFocus);
     void offerClipboard();
+    startStreamPolling();
     void listen<LogLine>("play-log", (e) => {
       const line = e.payload;
       if (!line?.msg) return;
@@ -274,6 +307,7 @@
       unsubs.forEach((u) => u());
       document.removeEventListener("click", onDocClick);
       window.removeEventListener("focus", onFocus);
+      window.clearInterval(streamPoller);
     };
   });
 
@@ -282,6 +316,7 @@
       workdir = await api.getWorkdir();
       hosts = await api.listHosts();
       dlConfig = await api.getDownloadConfig();
+      streams = await api.listStreams();
     } catch (e) {
       toastStore.push("error", String(e));
     }
@@ -464,9 +499,13 @@
 
   async function doPlay(extra = false) {
     playMenu = false;
-    if (!canAct) return;
+    if (!canPlay) return;
     const u = cleanUrl(url);
     busy = true;
+    playingOp = "play";
+    playStage = "";
+    playDone = 0;
+    playTotal = 1;
     pendingExtra = extra;
     try {
       const res = await api.play(u, quality || null, {
@@ -487,6 +526,10 @@
       toastStore.push("error", String(e));
     } finally {
       busy = false;
+      playingOp = null;
+      playStage = "";
+      playDone = 0;
+      playTotal = 1;
     }
   }
 
@@ -521,6 +564,27 @@
     try {
       const job = await api.cancelJob(id);
       upsertJob(job);
+    } catch (e) {
+      toastStore.push("error", String(e));
+    }
+  }
+
+  let streamPoller: number | undefined;
+  function startStreamPolling() {
+    window.clearInterval(streamPoller);
+    streamPoller = window.setInterval(() => {
+      if (streams.length === 0) return;
+      void api.streamStats().then((list) => {
+        streams = list;
+      }).catch(() => {});
+    }, 1500);
+  }
+
+  async function stopStream(id: number) {
+    try {
+      await api.stopStream(id);
+      streams = streams.filter((x) => x.id !== id);
+      addLog("info", `stopped stream ${id}`);
     } catch (e) {
       toastStore.push("error", String(e));
     }
@@ -650,6 +714,10 @@
   </header>
 
   <main class="flex min-h-0 flex-1">
+    <StreamsPane
+      {streams}
+      onStop={(id) => void stopStream(id)}
+    />
     <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden p-4">
     <section class="rounded-xl border border-surface-800 bg-surface-900 p-4">
       <div class="flex items-center justify-between gap-2">
@@ -704,9 +772,9 @@
               type="button"
               class="min-w-0 flex-1 rounded-l-lg bg-accent-600 px-3 py-2 text-sm font-semibold text-white shadow hover:bg-accent-500 disabled:opacity-45"
               onclick={() => doPlay(false)}
-              disabled={!canAct}
+              disabled={!canPlay}
             >
-              Play
+              {playingOp === "play" ? "Opening…" : "Play"}
             </button>
             <button
               type="button"
@@ -715,7 +783,7 @@
                 e.stopPropagation();
                 playMenu = !playMenu;
               }}
-              disabled={!cleanUrl(url)}
+              disabled={!cleanUrl(url) || playingOp !== null}
               aria-label="More play options"
             >
               ▾
@@ -749,6 +817,20 @@
       <p class="mt-1.5 text-[11px] leading-4 text-surface-500">
         Or send from the Send to Play extension in Brave.
       </p>
+      {#if playingOp === "play"}
+        <div class="mt-2" role="status" aria-live="polite">
+          <div class="flex items-center justify-between text-[11px] text-surface-400">
+            <span>{playStageLabel}…</span>
+            <span>{playPct}%</span>
+          </div>
+          <div class="mt-1 h-1.5 overflow-hidden rounded-full bg-surface-800">
+            <div
+              class="h-full rounded-full bg-accent-500 transition-[width]"
+              style={`width: ${playPct}%`}
+            ></div>
+          </div>
+        </div>
+      {/if}
       {#if subtitles.length > 0}
         <p class="mt-1 text-[11px] text-accent-400">
           {subtitles.length === 1

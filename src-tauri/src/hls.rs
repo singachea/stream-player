@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::error::{Error, Result};
-use crate::fetch::{http_get, http_get_retry};
+use crate::fetch::{http_get, http_get_retry, http_get_timeout};
 use crate::urls::join_url;
 
 static STREAM_INF: LazyLock<Regex> = LazyLock::new(|| {
@@ -230,6 +230,43 @@ pub fn unwrap_media(buf: &[u8]) -> (usize, &'static str) {
         return (skip + ts_off, "ts");
     }
     (skip, "ts")
+}
+
+/// Fetch one media segment and return the playable bytes (unwrapped,
+/// non-subtitle). Returns `None` for keys, subtitles, or error bodies.
+pub fn fetch_segment_body(
+    src: &str,
+    headers: &mut HashMap<String, String>,
+    rest: &str,
+) -> Option<Vec<u8>> {
+    let (_, body) = http_get_timeout(src, headers, 60).ok()?;
+    let body = unwrap_media_body(&body);
+    if subtitle_content_type(&body).is_some() {
+        return None;
+    }
+    if !rest.ends_with(".key")
+        && !rest.ends_with(".vtt")
+        && !rest.ends_with(".srt")
+        && looks_like_error_body(&body)
+    {
+        return None;
+    }
+    Some(body)
+}
+
+fn unwrap_media_body(body: &[u8]) -> Vec<u8> {
+    let (skip, _) = unwrap_media(&body[..body.len().min(65536)]);
+    let skip = skip.min(body.len());
+    body[skip..].to_vec()
+}
+
+fn looks_like_error_body(buf: &[u8]) -> bool {
+    let start = buf
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    let head = buf.get(start..buf.len().min(start + 96)).unwrap_or(&[]);
+    head.starts_with(b"<") || head.starts_with(b"{") || head.starts_with(b"[")
 }
 
 pub fn sniff_segment_kind(url: &str, headers: &mut HashMap<String, String>) -> &'static str {
@@ -457,6 +494,9 @@ pub fn rewrite_media_playlist(
     s
 }
 
+/// Progress callback: (stage, done, total, detail). `None` disables reporting.
+pub type PlayStage = dyn FnMut(&str, usize, usize, Option<String>) + Send;
+
 pub fn resolve_media_playlist<F>(
     url: &str,
     headers: &mut HashMap<String, String>,
@@ -464,10 +504,17 @@ pub fn resolve_media_playlist<F>(
     verbose: bool,
     interactive: Option<bool>,
     mut on_403: Option<&mut F>,
+    mut on_stage: Option<&mut PlayStage>,
 ) -> Result<ResolvedHls>
 where
     F: FnMut(&str, &mut HashMap<String, String>, &[u8]) -> Option<HashMap<String, String>> + ?Sized,
 {
+    let mut stage = |name: &str, done: usize, total: usize| {
+        if let Some(cb) = on_stage.as_deref_mut() {
+            cb(name, done, total, None);
+        }
+    };
+    stage("master", 0, 100);
     let (mut final_url, body) = http_get_retry(url, headers, on_403.as_deref_mut())?;
     let mut text = String::from_utf8_lossy(&body).into_owned();
     if !text.trim_start().starts_with("#EXTM3U") {
@@ -477,6 +524,7 @@ where
         )));
     }
     let subtitles = parse_subtitle_tracks(&text, &final_url);
+    stage("master", 25, 100);
     if text.contains("#EXT-X-STREAM-INF") {
         let variants = parse_variants(&text, &final_url);
         if verbose {
@@ -500,6 +548,7 @@ where
             eprintln!("play: chose {h}p {}", chosen.url);
         }
         let (u, body) = http_get_retry(&chosen.url, headers, on_403)?;
+        stage("variant", 60, 100);
         final_url = u;
         text = String::from_utf8_lossy(&body).into_owned();
         if !text.trim_start().starts_with("#EXTM3U") {
@@ -508,6 +557,9 @@ where
                 chosen.url
             )));
         }
+        stage("variant", 100, 100);
+    } else {
+        stage("master", 100, 100);
     }
     Ok(ResolvedHls {
         media_url: final_url,

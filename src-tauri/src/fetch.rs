@@ -104,8 +104,21 @@ fn is_embed_referer(stream_url: &str, referer: Option<&str>) -> bool {
     !stream_host.is_empty() && !ref_host.is_empty() && stream_host != ref_host
 }
 
+/// Two hosts share a registrable suffix (cdn A and embed B on one
+/// site stay distinct). Same host, subdomains, and parent domains match.
+fn same_site(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+}
+
 /// Same-origin GET (browser omits Origin). Cross-origin CORS Origin is sent.
-/// First-party Cookie is not sent to another host (the CDN).
+/// First-party Cookie is sent only to a same-site host (subdomains included);
+/// cross-site cookies are dropped.
 pub(crate) fn omit_curl_header(
     name: &str,
     value: &str,
@@ -127,7 +140,7 @@ pub(crate) fn omit_curl_header(
         if let Some(r) = referer {
             let uh = host_of_url(url);
             let rh = host_of_url(r);
-            if !uh.is_empty() && !rh.is_empty() && uh != rh {
+            if !same_site(&uh, &rh) {
                 return true;
             }
         }
@@ -177,6 +190,12 @@ pub fn http_403_hint(url: &str, body: &[u8]) -> String {
 pub fn http_403_hint_for(url: &str, body: &[u8], referer: Option<&str>) -> String {
     let n = body.len().min(8192);
     let text = String::from_utf8_lossy(&body[..n]).to_lowercase();
+    if text.contains("invalid signature") {
+        return " (stream token rejected. Copy a fresh URL from the player — \
+this token is expired or spent. Copy as cURL from a 200 request to include \
+the session Cookie)"
+            .into();
+    }
     if text.contains("website access blocked")
         || (text.contains("affected zone") && text.contains("violations"))
     {
@@ -994,6 +1013,28 @@ Terms of Service violations.The affected zone is cdn.example.",
             "https://embed.example/wrap/token.m3u8",
             &headers
         ));
+    }
+
+    #[test]
+    fn test_cookie_kept_for_same_site_subdomain() {
+        let headers = HashMap::from([
+            ("Referer".into(), "https://embed.example/watch/1".into()),
+            ("Cookie".into(), "sid=1".into()),
+        ]);
+        assert!(!omit_curl_header(
+            "Cookie",
+            "sid=1",
+            "https://cdn.embed.example/master.m3u8",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn test_invalid_signature_hint_suggests_fresh_url() {
+        let body = b"<span>Invalid signature.</span>";
+        let hint = http_403_hint("https://cdn.example/stream/token", body);
+        assert!(hint.contains("fresh URL"));
+        assert!(!hint.contains("--referer"));
     }
 
     #[test]

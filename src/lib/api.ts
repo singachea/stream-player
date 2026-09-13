@@ -83,6 +83,32 @@ export function stop(): Promise<void> {
   return invoke("stop_cmd");
 }
 
+export interface StreamSession {
+  id: number;
+  url: string;
+  host: string;
+  quality: string;
+  status: string;
+  pid?: number | null;
+  playhead?: number | null;
+  buffered: number;
+  total: number;
+  cachedBytes: number;
+  served: number;
+}
+
+export function listStreams(): Promise<StreamSession[]> {
+  return invoke("list_streams_cmd");
+}
+
+export function stopStream(id: number): Promise<void> {
+  return invoke("stop_stream_cmd", { id });
+}
+
+export function streamStats(): Promise<StreamSession[]> {
+  return invoke("stream_stats_cmd");
+}
+
 export function download(
   url: string,
   dest: string,

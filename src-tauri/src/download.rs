@@ -628,7 +628,10 @@ where
     F: FnMut(&str, &mut HashMap<String, String>, &[u8]) -> Option<HashMap<String, String>> + ?Sized,
 {
     match crate::urls::detect_kind(url) {
-        crate::urls::Kind::Http => download_http(url, headers, out_file, progress, cancel),
+        crate::urls::Kind::Http => {
+            let full = crate::urls::strip_range_query(url);
+            download_http(&full, headers, out_file, progress, cancel)
+        }
         crate::urls::Kind::Dash => Err(Error::msg("play: DASH download is not supported")),
         crate::urls::Kind::Hls => match resolve_media_playlist(
             crate::urls::strip_proto(url),
@@ -637,6 +640,7 @@ where
             verbose,
             Some(interactive),
             on_403,
+            None,
         ) {
             Ok(resolved) => with_cancel(cancel, || {
                 download_media(
@@ -651,7 +655,8 @@ where
                 )
             }),
             Err(Error::Progressive { .. }) => {
-                download_http(url, headers, out_file, progress, cancel)
+                let full = crate::urls::strip_range_query(url);
+                download_http(&full, headers, out_file, progress, cancel)
             }
             Err(e) => Err(e),
         },

@@ -24,3 +24,15 @@ vite.config.ts.timestamp-*
 
 src-tauri/target
 src-tauri/gen/schemas
+
+# Ruflo local secrets and runtime data
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+.claude-flow/metrics/
+.swarm/
+ruvector.db
+*.db-wal
+*.db-shm

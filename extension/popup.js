@@ -70,6 +70,13 @@ function label(url) {
   }
 }
 
+function formatTime(seenAt) {
+  if (!seenAt) return "";
+  const d = new Date(seenAt);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function render() {
   const rows = [...items.values()].sort((a, b) => rank(a.url) - rank(b.url));
   if (!rows.length) {
@@ -78,30 +85,36 @@ function render() {
     return;
   }
   listEl.replaceChildren();
-  for (const v of rows) {
+  for (const [i, v] of rows.entries()) {
     const row = document.createElement("div");
     row.className = "item";
+    const idx = document.createElement("div");
+    idx.className = "idx";
+    idx.textContent = String(i + 1);
     const meta = document.createElement("div");
     meta.className = "meta";
     const name = document.createElement("div");
     name.className = "name";
     name.textContent = label(v.url);
+    const time = document.createElement("div");
+    time.className = "time";
+    time.textContent = formatTime(v.seenAt);
     const sub = document.createElement("div");
     sub.className = "sub";
     sub.textContent = v.referer || v.initiator || v.url;
-    meta.append(name, sub);
+    meta.append(name, time, sub);
     if (isSub(v.url)) {
       const tag = document.createElement("div");
       tag.className = "sub";
       tag.textContent = "subtitle";
-      row.append(meta, tag);
+      row.append(idx, meta, tag);
     } else {
       const btn = document.createElement("button");
       btn.className = "send";
       btn.type = "button";
       btn.textContent = "Play";
       btn.addEventListener("click", () => sendToPlay(v, btn));
-      row.append(meta, btn);
+      row.append(idx, meta, btn);
     }
     listEl.append(row);
   }
@@ -130,6 +143,7 @@ async function sendToPlay(v, btn) {
         referer,
         origin: v.origin || undefined,
         userAgent: v.userAgent || undefined,
+        cookie: v.cookie || undefined,
         subtitles: subtitles.length ? subtitles : undefined,
       }),
     });

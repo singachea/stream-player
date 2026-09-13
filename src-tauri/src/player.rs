@@ -187,6 +187,22 @@ pub fn spawn_vlc(vlc: &Path, media_args: &[&str]) -> Result<Child> {
         .map_err(|e| Error::msg(format!("play: spawn VLC: {e}")))
 }
 
+/// Progress callback: (stage, done, total). Stages: playlist, sniff,
+/// proxy, subtitles, launch. `None` disables reporting (CLI path).
+pub type PlayStage = crate::hls::PlayStage;
+
+fn emit_stage_opt(
+    on_stage: &mut Option<&mut PlayStage>,
+    name: &str,
+    done: usize,
+    total: usize,
+    detail: Option<String>,
+) {
+    if let Some(cb) = on_stage.as_deref_mut() {
+        cb(name, done, total, detail);
+    }
+}
+
 pub fn start_hls_playback<F>(
     url: &str,
     headers: &mut HashMap<String, String>,
@@ -196,10 +212,13 @@ pub fn start_hls_playback<F>(
     interactive: bool,
     extra_subs: &[String],
     mut on_403: Option<&mut F>,
+    mut on_stage: Option<&mut PlayStage>,
+    prefetch_count: usize,
 ) -> Result<Playback>
 where
     F: FnMut(&str, &mut HashMap<String, String>, &[u8]) -> Option<HashMap<String, String>> + ?Sized,
 {
+    emit_stage_opt(&mut on_stage, "playlist", 0, 5, None);
     let resolved = resolve_media_playlist(
         url,
         headers,
@@ -207,11 +226,13 @@ where
         verbose,
         Some(interactive),
         on_403.as_deref_mut(),
+        on_stage.as_deref_mut(),
     )?;
     let media_url = resolved.media_url;
     let media_text = resolved.media_text;
     let mut subs = resolved.subtitles;
     merge_extra_subs(&mut subs, extra_subs);
+    emit_stage_opt(&mut on_stage, "sniff", 1, 5, None);
     let first = map_or_first_segment_url(&media_url, &media_text);
     let ext = first
         .as_deref()
@@ -222,13 +243,16 @@ where
         eprintln!("play: {hint}");
     }
     let mut segments = Vec::new();
+    emit_stage_opt(&mut on_stage, "proxy", 2, 5, None);
     let proxy = start_proxy(headers.clone(), Vec::new(), Vec::new(), verbose)?;
     let rewritten =
         rewrite_media_playlist(&media_text, &media_url, &proxy.base, &mut segments, ext);
     let mut files = HashMap::new();
     let mut hls_subs: Vec<(SubtitleTrack, String)> = Vec::new();
     let mut sidecar: Vec<String> = Vec::new();
+    let total_subs = subs.len().max(1);
     for (i, track) in subs.iter().enumerate() {
+        emit_stage_opt(&mut on_stage, "subtitles", i, total_subs, Some(track.name.clone()));
         let got = http_get(&track.url, headers);
         let Ok((final_u, body)) = got else {
             if verbose {
@@ -276,7 +300,22 @@ where
     let mut args = vlc_sub_options(&sidecar, embedded);
     args.push(play_url.clone());
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    if prefetch_count > 0 {
+        let total = prefetch_count.min(proxy.state.lock().unwrap().segments.len());
+        crate::proxy::prefetch_segments(&proxy, prefetch_count, |done, _| {
+            emit_stage_opt(
+                &mut on_stage,
+                "buffer",
+                done,
+                total.max(1),
+                Some(format!("{done}/{total} segments")),
+            );
+        });
+        hint = format!("{hint} buffered={total}");
+    }
+    emit_stage_opt(&mut on_stage, "launch", 4, 5, None);
     let child = spawn_vlc(vlc, &arg_refs)?;
+    emit_stage_opt(&mut on_stage, "launch", 5, 5, None);
     Ok(Playback {
         proxy,
         child,
@@ -295,7 +334,7 @@ pub fn dry_run_hls<F>(
 where
     F: FnMut(&str, &mut HashMap<String, String>, &[u8]) -> Option<HashMap<String, String>> + ?Sized,
 {
-    let resolved = resolve_media_playlist(url, headers, quality, verbose, Some(false), on_403)?;
+    let resolved = resolve_media_playlist(url, headers, quality, verbose, Some(false), on_403, None)?;
     let media_url = resolved.media_url;
     let media_text = resolved.media_text;
     if !resolved.subtitles.is_empty() {
@@ -362,14 +401,19 @@ pub fn start_http_playback(
     vlc: &Path,
     verbose: bool,
     extra_subs: &[String],
+    mut on_stage: Option<&mut PlayStage>,
 ) -> Result<Playback> {
-    let proxy = start_file_proxy(url.to_string(), headers.clone(), verbose)?;
+    emit_stage_opt(&mut on_stage, "proxy", 0, 2, None);
+    let full = crate::urls::strip_range_query(url);
+    let proxy = start_file_proxy(full, headers.clone(), verbose)?;
     let local = proxy.file_url();
     let mut sidecar = Vec::new();
     if !extra_subs.is_empty() {
         let mut files = HashMap::new();
         let mut hdrs = headers.clone();
+        let total_subs = extra_subs.len().max(1);
         for (i, u) in extra_subs.iter().enumerate() {
+            emit_stage_opt(&mut on_stage, "subtitles", i, total_subs, Some(u.clone()));
             let Ok((_, body)) = http_get(u, &mut hdrs) else {
                 continue;
             };
@@ -388,7 +432,9 @@ pub fn start_http_playback(
     let mut args = vlc_sub_options(&sidecar, false);
     args.push(local.clone());
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    emit_stage_opt(&mut on_stage, "launch", 1, 2, None);
     let child = spawn_vlc(vlc, &arg_refs)?;
+    emit_stage_opt(&mut on_stage, "launch", 2, 2, None);
     Ok(Playback {
         proxy,
         child,

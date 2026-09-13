@@ -11,14 +11,23 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Response, Server, StatusCode};
 
 use crate::error::{Error, Result};
-use crate::fetch::{curl_push_url, current_cancel, http_get_timeout};
-use crate::hls::{subtitle_content_type, unwrap_media};
+use crate::fetch::{curl_push_url, current_cancel};
+use crate::hls::{fetch_segment_body, subtitle_content_type, unwrap_media};
 
 pub struct ProxyState {
     pub playlist: Vec<u8>,
     pub headers: HashMap<String, String>,
     pub segments: Vec<String>,
     pub files: HashMap<String, Vec<u8>>,
+    /// Prefetched segment bodies by index. Filled before VLC launches when
+    /// buffer-first is on, so slow remotes start with a cushion.
+    pub seg_cache: HashMap<usize, Vec<u8>>,
+    /// Highest segment index VLC has requested. Used as the playhead.
+    pub served_max: Option<usize>,
+    /// Total segment requests served to VLC.
+    pub served_count: u64,
+    /// Cached bytes currently held.
+    pub cached_bytes: u64,
     pub verbose: bool,
     pub source: Option<String>,
     pub on_log: Option<Arc<dyn Fn(&str, String) + Send + Sync>>,
@@ -32,6 +41,18 @@ pub struct ProxyHandle {
     thread: Option<JoinHandle<()>>,
     pub state: Arc<Mutex<ProxyState>>,
     pub base: String,
+}
+
+impl Clone for ProxyHandle {
+    fn clone(&self) -> Self {
+        Self {
+            stop: self.stop.clone(),
+            server: self.server.clone(),
+            thread: None,
+            state: self.state.clone(),
+            base: self.base.clone(),
+        }
+    }
 }
 
 impl ProxyHandle {
@@ -83,6 +104,10 @@ pub fn start_proxy(
         headers,
         segments,
         files: HashMap::new(),
+        seg_cache: HashMap::new(),
+        served_max: None,
+        served_count: 0,
+        cached_bytes: 0,
         verbose,
         source: None,
         on_log: None,
@@ -98,7 +123,8 @@ pub fn start_proxy(
                 break;
             }
             let st = st.clone();
-            thread::spawn(move || handle(request, &st));
+            let stop3 = stop2.clone();
+            thread::spawn(move || handle(request, &st, &stop3));
         }
     });
     Ok(ProxyHandle {
@@ -120,13 +146,168 @@ pub fn start_file_proxy(
     Ok(handle)
 }
 
-fn looks_like_error_body(buf: &[u8]) -> bool {
-    let start = buf
-        .iter()
-        .position(|&b| !b.is_ascii_whitespace())
-        .unwrap_or(0);
-    let head = buf.get(start..buf.len().min(start + 96)).unwrap_or(&[]);
-    head.starts_with(b"<") || head.starts_with(b"{") || head.starts_with(b"[")
+/// Download the first `count` media segments into the proxy cache so VLC
+/// starts with buffered data on slow remotes. Reports (done, total) per
+/// segment. Stops at the first failure; uncached segments stream on demand.
+pub fn prefetch_segments(
+    handle: &ProxyHandle,
+    count: usize,
+    mut on_step: impl FnMut(usize, usize),
+) {
+    fill_cache(handle, 0, count, &mut on_step);
+}
+
+/// Fill cache for segment range [start, start+count). Reports (done, total)
+/// per segment. Skips already cached. Stops at the first failure.
+fn fill_cache(
+    handle: &ProxyHandle,
+    start: usize,
+    count: usize,
+    on_step: &mut impl FnMut(usize, usize),
+) {
+    let (segments, headers) = {
+        let st = handle.state.lock().unwrap();
+        (st.segments.clone(), st.headers.clone())
+    };
+    let end = (start + count).min(segments.len());
+    let total = end.saturating_sub(start);
+    if total == 0 {
+        return;
+    }
+    let rest_ext = "ts";
+    for (n, src) in segments.iter().enumerate().take(end).skip(start) {
+        if handle.state.lock().unwrap().seg_cache.contains_key(&n) {
+            on_step(n - start + 1, total);
+            continue;
+        }
+        let mut hdrs = headers.clone();
+        match fetch_segment_body(src, &mut hdrs, rest_ext) {
+            Some(body) => {
+                let mut st = handle.state.lock().unwrap();
+                st.cached_bytes += body.len() as u64;
+                st.seg_cache.insert(n, body);
+                drop(st);
+                on_step(n - start + 1, total);
+            }
+            None => {
+                on_step(n - start, total);
+                break;
+            }
+        }
+    }
+}
+
+/// Keep downloading segments ahead of `from` in the background so the
+/// buffer stays ahead of VLC on slow remotes. Runs until `count` ahead
+/// are cached, a fetch fails, or the proxy shuts down.
+#[allow(dead_code)]
+pub fn readahead(handle: &ProxyHandle, from: usize, count: usize) {
+    let (segments, headers) = {
+        let st = handle.state.lock().unwrap();
+        (st.segments.clone(), st.headers.clone())
+    };
+    let rest_ext = "ts";
+    let end = (from + count).min(segments.len());
+    for n in from..end {
+        if stop_flag(handle) {
+            break;
+        }
+        if handle.state.lock().unwrap().seg_cache.contains_key(&n) {
+            continue;
+        }
+        let Some(src) = segments.get(n) else {
+            break;
+        };
+        let mut hdrs = headers.clone();
+        match fetch_segment_body(src, &mut hdrs, rest_ext) {
+            Some(body) => {
+                let mut st = handle.state.lock().unwrap();
+                st.cached_bytes += body.len() as u64;
+                st.seg_cache.insert(n, body);
+            }
+            None => break,
+        }
+    }
+}
+
+fn stop_flag(handle: &ProxyHandle) -> bool {
+    handle.stop.load(Ordering::SeqCst)
+}
+
+/// After serving a segment, keep 10% of the whole playlist cached ahead
+/// of the playhead. A 789-segment playlist keeps ~79 ahead from any seek
+/// point. Runs in the background; seeks just move the playhead and the
+/// window follows.
+fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
+    let (segments, headers, start, total) = {
+        let st = state.lock().unwrap();
+        let total = st.segments.len();
+        if total == 0 {
+            return;
+        }
+        let start = st.served_max.map_or(0, |h| h + 1);
+        (st.segments.clone(), st.headers.clone(), start, total)
+    };
+    let want = readahead_window(total, start);
+    if want == 0 {
+        return;
+    }
+    let have = {
+        let st = state.lock().unwrap();
+        (start..total)
+            .take_while(|n| st.seg_cache.contains_key(n))
+            .count()
+    };
+    if have >= want {
+        return;
+    }
+    thread::spawn(move || {
+        fill_range(&segments, &headers, &state, &stop, start, want);
+    });
+}
+
+/// Segments to keep cached ahead: 10% of the whole playlist from the
+/// playhead, capped by what remains. At least 1 while anything remains.
+fn readahead_window(total: usize, start: usize) -> usize {
+    let remaining = total.saturating_sub(start);
+    if remaining == 0 {
+        return 0;
+    }
+    (total / 10).max(1).min(remaining)
+}
+
+/// Download [start, start+count) into the cache. Skips cached entries,
+/// stops at the first failure or when the proxy shuts down.
+fn fill_range(
+    segments: &[String],
+    headers: &HashMap<String, String>,
+    state: &Mutex<ProxyState>,
+    stop: &AtomicBool,
+    start: usize,
+    count: usize,
+) {
+    let rest_ext = "ts";
+    let end = (start + count).min(segments.len());
+    for n in start..end {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if state.lock().unwrap().seg_cache.contains_key(&n) {
+            continue;
+        }
+        let Some(src) = segments.get(n) else {
+            break;
+        };
+        let mut hdrs = headers.clone();
+        match fetch_segment_body(src, &mut hdrs, rest_ext) {
+            Some(body) => {
+                let mut st = state.lock().unwrap();
+                st.cached_bytes += body.len() as u64;
+                st.seg_cache.insert(n, body);
+            }
+            None => break,
+        }
+    }
 }
 
 fn proxy_log(state: &Mutex<ProxyState>, level: &str, msg: String) {
@@ -183,7 +364,35 @@ fn respond_bytes(request: tiny_http::Request, body: Vec<u8>, ctype: &[u8]) {
     let _ = request.respond(resp);
 }
 
-fn handle(request: tiny_http::Request, state: &Mutex<ProxyState>) {
+fn respond_segment(request: tiny_http::Request, body: &[u8], rest: &str) {
+    if let Some(ctype) = subtitle_content_type(body) {
+        respond_bytes(request, body.to_vec(), ctype.as_bytes());
+        return;
+    }
+    let (skip, kind) = unwrap_media(&body[..body.len().min(65536)]);
+    let skip = skip.min(body.len());
+    let out = body[skip..].to_vec();
+    let ctype: &[u8] = if rest.ends_with(".vtt") || rest.ends_with(".srt") {
+        file_content_type(rest)
+    } else if kind == "m4s" {
+        b"video/mp4"
+    } else {
+        b"video/MP2T"
+    };
+    let resp = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes(&b"Content-Type"[..], ctype).unwrap(),
+            Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
+        ],
+        Cursor::new(out.clone()),
+        Some(out.len()),
+        None,
+    );
+    let _ = request.respond(resp);
+}
+
+fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Arc<AtomicBool>) {
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or(&url);
     if let Some(body) = state.lock().unwrap().files.get(path).cloned() {
@@ -224,7 +433,14 @@ fn handle(request: tiny_http::Request, state: &Mutex<ProxyState>) {
             }
         };
         let (src, headers, is_key) = {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            if let Some(cached) = st.seg_cache.get(&idx).cloned() {
+                st.served_count += 1;
+                st.served_max = Some(st.served_max.map_or(idx, |m| m.max(idx)));
+                drop(st);
+                respond_segment(request, &cached, rest);
+                return;
+            }
             let src = match st.segments.get(idx) {
                 Some(s) => s.clone(),
                 None => {
@@ -237,9 +453,9 @@ fn handle(request: tiny_http::Request, state: &Mutex<ProxyState>) {
             (src, st.headers.clone(), rest.ends_with(".key"))
         };
         let mut hdrs = headers;
-        match http_get_timeout(&src, &mut hdrs, 60) {
-            Ok((_, body)) => {
-                if is_key {
+        if is_key {
+            match crate::fetch::http_get(&src, &mut hdrs) {
+                Ok((_, body)) => {
                     let resp = Response::new(
                         StatusCode(200),
                         vec![Header::from_bytes(
@@ -252,48 +468,35 @@ fn handle(request: tiny_http::Request, state: &Mutex<ProxyState>) {
                         None,
                     );
                     let _ = request.respond(resp);
-                    return;
                 }
-                if let Some(ctype) = subtitle_content_type(&body) {
-                    respond_bytes(request, body, ctype.as_bytes());
-                    return;
-                }
-                let (skip, kind) = unwrap_media(&body[..body.len().min(65536)]);
-                let skip = skip.min(body.len());
-                let out = body[skip..].to_vec();
-                if looks_like_error_body(&out) {
-                    proxy_log(
-                        state,
-                        "warn",
-                        format!("seg {idx} {src} → {} bytes not media", out.len()),
+                Err(Error::Http { code, .. }) => {
+                    proxy_log(state, "error", format!("seg {idx} {src} → HTTP {code}"));
+                    let _ = request.respond(
+                        Response::from_string(format!("upstream {code}")).with_status_code(code),
                     );
                 }
-                let ctype: &[u8] = if rest.ends_with(".vtt") || rest.ends_with(".srt") {
-                    file_content_type(rest)
-                } else if kind == "m4s" {
-                    b"video/mp4"
-                } else {
-                    b"video/MP2T"
-                };
-                let resp = Response::new(
-                    StatusCode(200),
-                    vec![
-                        Header::from_bytes(&b"Content-Type"[..], ctype).unwrap(),
-                        Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
-                    ],
-                    Cursor::new(out.clone()),
-                    Some(out.len()),
-                    None,
-                );
-                let _ = request.respond(resp);
+                Err(_) => {
+                    proxy_log(state, "error", format!("seg {idx} {src} → upstream failed"));
+                    let _ = request.respond(
+                        Response::from_string("upstream failed").with_status_code(502),
+                    );
+                }
             }
-            Err(Error::Http { code, .. }) => {
-                proxy_log(state, "error", format!("seg {idx} {src} → HTTP {code}"));
-                let _ = request.respond(
-                    Response::from_string(format!("upstream {code}")).with_status_code(code),
-                );
+            return;
+        }
+        match fetch_segment_body(&src, &mut hdrs, rest) {
+            Some(body) => {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.cached_bytes += body.len() as u64;
+                    st.seg_cache.insert(idx, body.clone());
+                    st.served_count += 1;
+                    st.served_max = Some(st.served_max.map_or(idx, |m| m.max(idx)));
+                }
+                respond_segment(request, &body, rest);
+                trigger_readahead(state.clone(), stop.clone());
             }
-            Err(_) => {
+            None => {
                 proxy_log(state, "error", format!("seg {idx} {src} → upstream failed"));
                 let _ =
                     request.respond(Response::from_string("upstream failed").with_status_code(502));
@@ -312,7 +515,7 @@ fn stream_file(request: tiny_http::Request, src: &str, state: &Mutex<ProxyState>
         .iter()
         .find(|h| h.field.equiv("Range"))
         .map(|h| h.value.as_str().to_string());
-    let fetch = src.to_string();
+    let fetch = crate::urls::strip_range_query(src);
     let n = std::process::id();
     let dir = std::env::temp_dir().join(format!(
         "play-proxy-{}-{}",
@@ -495,4 +698,22 @@ fn parse_upstream_headers(text: &str) -> (u16, String, Option<usize>, Option<Str
         }
     }
     (code, ctype, clen, crange)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_readahead_window_is_ten_percent() {
+        // 789-segment playlist keeps ~79 ahead from any seek point.
+        assert_eq!(readahead_window(789, 0), 78);
+        assert_eq!(readahead_window(789, 400), 78);
+        // Capped by what remains near the end.
+        assert_eq!(readahead_window(789, 780), 9);
+        assert_eq!(readahead_window(100, 90), 10);
+        assert_eq!(readahead_window(5, 0), 1);
+        assert_eq!(readahead_window(10, 10), 0);
+        assert_eq!(readahead_window(0, 0), 0);
+    }
 }

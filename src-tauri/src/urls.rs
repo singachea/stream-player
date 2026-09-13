@@ -140,6 +140,30 @@ pub fn auto_filename(url: &str) -> String {
     format!("{stem}{ext}")
 }
 
+/// Some CDNs (okcdn `vd*.okcdn.ru`) encode the byte range in a `bytes=START-END`
+/// query param instead of a `Range` header. A captured URL like `...&bytes=0-47101`
+/// is only that 47KB slice: VLC gets a truncated file and reports
+/// `mkv demux error: cannot find any cluster or chapter`. Drop the param so
+/// playback and download fetch the whole file; VLC seeks with Range headers.
+pub fn strip_range_query(url: &str) -> String {
+    let Ok(mut u) = Url::parse(strip_proto(url)) else {
+        return url.to_string();
+    };
+    let kept: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("bytes"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if kept.len() == u.query_pairs().count() {
+        return url.to_string();
+    }
+    u.query_pairs_mut().clear();
+    for (k, v) in &kept {
+        u.query_pairs_mut().append_pair(k, v);
+    }
+    u.to_string()
+}
+
 fn pct_encode(s: &str, allow_slash: bool, allow_eq: bool) -> String {
     let mut out = String::new();
     for &b in s.as_bytes() {
@@ -708,6 +732,19 @@ mod tests {
         assert_eq!(
             origin_of("https://cdn.example/hls/master.m3u8").unwrap(),
             "https://cdn.example"
+        );
+    }
+
+    #[test]
+    fn test_strip_range_query_removes_bytes_slice() {
+        let url = "https://cdn.example/?expires=1&id=620097243758&bytes=0-47101";
+        let full = strip_range_query(url);
+        assert!(!full.contains("bytes="), "range slice must go: {full}");
+        assert!(full.contains("expires=1"));
+        assert!(full.contains("id=620097243758"));
+        assert_eq!(
+            strip_range_query("https://cdn.example/hls/master.m3u8?token=abc"),
+            "https://cdn.example/hls/master.m3u8?token=abc"
         );
     }
 

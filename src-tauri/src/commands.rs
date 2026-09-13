@@ -42,6 +42,8 @@ pub struct AppState {
     pub jobs: Mutex<BTreeMap<u64, Job>>,
     pub job_seq: AtomicU64,
     pub pending_capture: Mutex<Option<ParsedCurl>>,
+    pub streams: Mutex<BTreeMap<u64, StreamSession>>,
+    pub stream_seq: AtomicU64,
 }
 
 impl AppState {
@@ -54,8 +56,94 @@ impl AppState {
             jobs: Mutex::new(BTreeMap::new()),
             job_seq: AtomicU64::new(1),
             pending_capture: Mutex::new(None),
+            streams: Mutex::new(BTreeMap::new()),
+            stream_seq: AtomicU64::new(1),
         }
     }
+}
+
+/// One playing stream: VLC process plus its proxy cache.
+pub struct StreamSession {
+    id: u64,
+    url: String,
+    quality: String,
+    pid: Option<u32>,
+    status: String,
+    proxy: Option<ProxyHandle>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamDto {
+    pub id: u64,
+    pub url: String,
+    pub host: String,
+    pub quality: String,
+    pub status: String,
+    pub pid: Option<u32>,
+    /// Highest segment index VLC has requested (playhead).
+    pub playhead: Option<usize>,
+    /// Segments cached ahead of the playhead.
+    pub buffered: usize,
+    pub total: usize,
+    pub cached_bytes: u64,
+    pub served: u64,
+}
+
+impl StreamSession {
+    fn dto(&self) -> StreamDto {
+        let (playhead, buffered, total, cached_bytes, served) = match &self.proxy {
+            Some(p) => {
+                let st = p.state.lock().unwrap();
+                let total = st.segments.len();
+                let playhead = st.served_max;
+                // Contiguous cached run ahead of the playhead. Sparse
+                // entries past a gap do not count: VLC cannot play them yet.
+                let start = playhead.map_or(0, |h| h + 1);
+                let mut buffered = 0;
+                for n in start..total {
+                    if st.seg_cache.contains_key(&n) {
+                        buffered += 1;
+                    } else {
+                        break;
+                    }
+                }
+                (
+                    playhead,
+                    buffered,
+                    total,
+                    st.cached_bytes,
+                    st.served_count,
+                )
+            }
+            None => (None, 0, 0, 0, 0),
+        };
+        StreamDto {
+            id: self.id,
+            url: self.url.clone(),
+            host: host_of(&self.url),
+            quality: self.quality.clone(),
+            status: self.status.clone(),
+            pid: self.pid,
+            playhead,
+            buffered,
+            total,
+            cached_bytes,
+            served,
+        }
+    }
+}
+
+fn emit_stream(app: &AppHandle, dto: &StreamDto) {
+    let _ = app.emit("stream-updated", dto);
+}
+
+fn patch_stream(app: &AppHandle, id: u64, f: impl FnOnce(&mut StreamSession)) -> Option<StreamDto> {
+    let st = app.state::<AppState>();
+    let mut streams = st.streams.lock().unwrap();
+    let s = streams.get_mut(&id)?;
+    f(s);
+    Some(s.dto())
 }
 
 #[derive(Clone, Serialize)]
@@ -421,32 +509,49 @@ pub fn delete_host_cmd(
     list_hosts_cmd(app, state)
 }
 
-#[tauri::command]
-pub fn resolve_cmd(
+#[tauri::command(async)]
+pub async fn resolve_cmd(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     url: String,
     referer: Option<String>,
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
 ) -> Result<ResolveResponse, String> {
+    let app2 = app.clone();
     let dir = workdir(&app, &state);
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_blocking(&app2, &dir, &url, referer, origin, user_agent, cookie)
+    })
+    .await
+    .map_err(|e| format!("play: resolve task failed: {e}"))?
+}
+
+fn resolve_blocking(
+    app: &AppHandle,
+    dir: &std::path::Path,
+    url: &str,
+    referer: Option<String>,
+    origin: Option<String>,
+    user_agent: Option<String>,
+    cookie: Option<String>,
+) -> Result<ResolveResponse, String> {
     let (headers, _prefs, _path) = load_headers(
-        &url,
-        &dir,
+        url,
+        dir,
         referer.as_deref(),
         origin.as_deref(),
         user_agent.as_deref(),
         cookie.as_deref(),
     )
     .map_err(err_str)?;
-    let kind = detect_kind(&url);
-    let host = host_of(&url);
+    let kind = detect_kind(url);
+    let host = host_of(url);
     let referer_s = headers.get("Referer").cloned().unwrap_or_default();
     let origin_s = headers.get("Origin").cloned().unwrap_or_default();
     log(
-        &app,
+        app,
         "info",
         format!(
             "resolve {} {url}  Referer={}  Origin={}{}",
@@ -462,7 +567,7 @@ pub fn resolve_cmd(
     );
     if kind != Kind::Hls {
         log(
-            &app,
+            app,
             "debug",
             format!("not HLS ({}), no variant list", kind.as_str()),
         );
@@ -474,13 +579,13 @@ pub fn resolve_cmd(
             origin: origin_s,
         });
     }
-    let fetch_url = strip_proto(&url);
-    log(&app, "debug", format!("GET {fetch_url}"));
+    let fetch_url = strip_proto(url);
+    log(app, "debug", format!("GET {fetch_url}"));
     let got = http_get_maybe_playlist(fetch_url, &headers);
     match got {
         Ok(MaybePlaylist::Progressive { url: final_url }) => {
             log(
-                &app,
+                app,
                 "info",
                 format!("not a playlist, treating as a file ({final_url})"),
             );
@@ -497,7 +602,7 @@ pub fn resolve_cmd(
             body,
         }) => {
             log(
-                &app,
+                app,
                 "debug",
                 format!("GET {} → {} bytes", final_url, body.len()),
             );
@@ -513,7 +618,7 @@ pub fn resolve_cmd(
                 }]
             };
             let labels: Vec<_> = variants.iter().map(|v| v.label.as_str()).collect();
-            log(&app, "info", format!("qualities: {}", labels.join(", ")));
+            log(app, "info", format!("qualities: {}", labels.join(", ")));
             Ok(ResolveResponse::Ok {
                 kind: "hls".into(),
                 host,
@@ -523,16 +628,16 @@ pub fn resolve_cmd(
             })
         }
         Err(e) => {
-            log(&app, "error", e.to_string());
-            map_403(&url, e)
+            log(app, "error", e.to_string());
+            map_403(url, e)
         }
     }
 }
 
-#[tauri::command]
-pub fn play_cmd(
+#[tauri::command(async)]
+pub async fn play_cmd(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     url: String,
     quality: Option<String>,
     referer: Option<String>,
@@ -541,16 +646,117 @@ pub fn play_cmd(
     cookie: Option<String>,
     extra: Option<bool>,
     subtitles: Option<Vec<String>>,
+    prefetch_count: Option<usize>,
+) -> Result<ResolveResponse, String> {
+    let app2 = app.clone();
+    let dir = workdir(&app, &state);
+    tauri::async_runtime::spawn_blocking(move || {
+        play_blocking(
+            &app2,
+            &dir,
+            &url,
+            quality,
+            referer,
+            origin,
+            user_agent,
+            cookie,
+            extra,
+            subtitles,
+            prefetch_count,
+        )
+    })
+    .await
+    .map_err(|e| format!("play: play task failed: {e}"))?
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayProgress {
+    stage: String,
+    stage_key: String,
+    done: usize,
+    total: usize,
+}
+
+fn emit_progress(
+    app: &AppHandle,
+    stage_key: &str,
+    label: &str,
+    done: usize,
+    total: usize,
+) {
+    let _ = app.emit(
+        "play-progress",
+        PlayProgress {
+            stage: label.to_string(),
+            stage_key: stage_key.to_string(),
+            done,
+            total,
+        },
+    );
+}
+
+fn emit_stage(
+    app: &AppHandle,
+    stage: &str,
+    done: usize,
+    total: usize,
+    detail: Option<String>,
+) {
+    let total = total.max(1);
+    let done = done.min(total);
+    match stage {
+        "master" => emit_progress(app, "playlist", "Fetching master playlist", done, total),
+        "variant" => emit_progress(app, "playlist", "Fetching quality playlist", done, total),
+        "playlist" => emit_progress(app, "playlist", "Fetching playlist", done, total),
+        "sniff" => emit_progress(app, "sniff", "Sniffing first segment", done, total),
+        "proxy" => emit_progress(app, "proxy", "Starting local proxy", done, total),
+        "subtitles" => {
+            let label = match detail {
+                Some(name) if !name.is_empty() => format!("Fetching subtitle {name}"),
+                _ if total > 1 => format!("Fetching subtitles {done}/{total}"),
+                _ => "Fetching subtitles".into(),
+            };
+            emit_progress(app, "subtitles", &label, done, total);
+        }
+        "launch" => emit_progress(app, "launch", "Launching VLC", done, total),
+        "buffer" => {
+            let label = match detail {
+                Some(d) if !d.is_empty() => format!("Buffering {d}"),
+                _ if total > 1 => format!("Buffering {done}/{total}"),
+                _ => "Buffering".into(),
+            };
+            emit_progress(app, "buffer", &label, done, total);
+        }
+        other => emit_progress(app, "playlist", other, done, total),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_blocking(
+    app: &AppHandle,
+    dir: &std::path::Path,
+    url: &str,
+    quality: Option<String>,
+    referer: Option<String>,
+    origin: Option<String>,
+    user_agent: Option<String>,
+    cookie: Option<String>,
+    extra: Option<bool>,
+    subtitles: Option<Vec<String>>,
+    prefetch_count: Option<usize>,
 ) -> Result<ResolveResponse, String> {
     let extra = extra.unwrap_or(false);
+    let prefetch_count = prefetch_count.unwrap_or(3).min(20);
     let extra_subs: Vec<String> = subtitles
         .unwrap_or_default()
         .into_iter()
         .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
         .collect();
-    let dir = workdir(&app, &state);
+    let state = app.state::<AppState>();
+    let state = state.inner();
     let (mut headers, _prefs, _path) = load_headers(
-        &url,
+        url,
         &dir,
         referer.as_deref(),
         origin.as_deref(),
@@ -558,11 +764,11 @@ pub fn play_cmd(
         cookie.as_deref(),
     )
     .map_err(err_str)?;
-    let kind = detect_kind(&url);
+    let kind = detect_kind(url);
     let vlc = vlc_path();
     let q = quality.as_deref().unwrap_or("best");
     log(
-        &app,
+        app,
         "info",
         format!(
             "play {} {url} quality={q}{}  Referer={}  Origin={}{}",
@@ -581,31 +787,46 @@ pub fn play_cmd(
         Kind::Http | Kind::Dash => {
             let referer = headers.get("Referer").cloned().unwrap_or_default();
             let origin = headers.get("Origin").cloned().unwrap_or_default();
-            let pb =
-                start_http_playback(&url, &headers, &vlc, false, &extra_subs).map_err(|e| {
-                    log(&app, "error", e.to_string());
-                    err_str(e)
-                })?;
+            let app_stage = app.clone();
+            let mut on_stage = move |stage: &str, done: usize, total: usize, detail: Option<String>| {
+                emit_stage(&app_stage, stage, done, total, detail);
+            };
+            let pb = start_http_playback(
+                url,
+                &headers,
+                &vlc,
+                false,
+                &extra_subs,
+                Some(&mut on_stage),
+            )
+            .map_err(|e| {
+                log(app, "error", e.to_string());
+                err_str(e)
+            })?;
             let local = pb.play_url.clone();
             let pid = pb.child.id();
-            log_vlc(&app, "debug", pid, format!("local file {local}"));
+            log_vlc(app, "debug", pid, format!("local file {local}"));
             if !pb.hint.is_empty() {
-                log_vlc(&app, "debug", pid, pb.hint.clone());
+                log_vlc(app, "debug", pid, pb.hint.clone());
             }
-            spawn_session(&app, &state, pb.child, Some(pb.proxy), extra);
+            spawn_session(app, state, pb.child, Some(pb.proxy), extra, url, q);
             Ok(ResolveResponse::Ok {
                 kind: kind.as_str().into(),
-                host: host_of(&url),
+                host: host_of(url),
                 variants: vec![],
                 referer,
                 origin,
             })
         }
         Kind::Hls => {
+            let app_stage = app.clone();
+            let mut on_stage = move |stage: &str, done: usize, total: usize, detail: Option<String>| {
+                emit_stage(&app_stage, stage, done, total, detail);
+            };
             match start_hls_playback::<
                 fn(&str, &mut HashMap<String, String>, &[u8]) -> Option<HashMap<String, String>>,
             >(
-                strip_proto(&url),
+                strip_proto(url),
                 &mut headers,
                 quality.as_deref(),
                 &vlc,
@@ -613,20 +834,22 @@ pub fn play_cmd(
                 false,
                 &extra_subs,
                 None,
+                Some(&mut on_stage),
+                prefetch_count,
             ) {
                 Ok(pb) => {
                     let referer = headers.get("Referer").cloned().unwrap_or_default();
                     let origin = headers.get("Origin").cloned().unwrap_or_default();
                     let local = pb.play_url.clone();
                     let pid = pb.child.id();
-                    log_vlc(&app, "debug", pid, format!("local playlist {local}"));
+                    log_vlc(app, "debug", pid, format!("local playlist {local}"));
                     if !pb.hint.is_empty() {
-                        log_vlc(&app, "debug", pid, pb.hint.clone());
+                        log_vlc(app, "debug", pid, pb.hint.clone());
                     }
-                    spawn_session(&app, &state, pb.child, Some(pb.proxy), extra);
+                    spawn_session(app, state, pb.child, Some(pb.proxy), extra, url, q);
                     Ok(ResolveResponse::Ok {
                         kind: "hls".into(),
-                        host: host_of(&url),
+                        host: host_of(url),
                         variants: vec![],
                         referer,
                         origin,
@@ -634,32 +857,39 @@ pub fn play_cmd(
                 }
                 Err(Error::Progressive { .. }) => {
                     log(
-                        &app,
+                        app,
                         "info",
                         format!("not a playlist, playing as a file ({url})"),
                     );
                     let referer = headers.get("Referer").cloned().unwrap_or_default();
                     let origin = headers.get("Origin").cloned().unwrap_or_default();
-                    let pb = start_http_playback(&url, &headers, &vlc, false, &extra_subs)
-                        .map_err(|e| {
-                            log(&app, "error", e.to_string());
-                            err_str(e)
-                        })?;
+                    let pb = start_http_playback(
+                        url,
+                        &headers,
+                        &vlc,
+                        false,
+                        &extra_subs,
+                        Some(&mut on_stage),
+                    )
+                    .map_err(|e| {
+                        log(app, "error", e.to_string());
+                        err_str(e)
+                    })?;
                     let local = pb.play_url.clone();
                     let pid = pb.child.id();
-                    log_vlc(&app, "debug", pid, format!("local file {local}"));
-                    spawn_session(&app, &state, pb.child, Some(pb.proxy), extra);
+                    log_vlc(app, "debug", pid, format!("local file {local}"));
+                    spawn_session(app, state, pb.child, Some(pb.proxy), extra, url, q);
                     Ok(ResolveResponse::Ok {
                         kind: "http".into(),
-                        host: host_of(&url),
+                        host: host_of(url),
                         variants: vec![],
                         referer,
                         origin,
                     })
                 }
                 Err(e) => {
-                    log(&app, "error", e.to_string());
-                    map_403(&url, e)
+                    log(app, "error", e.to_string());
+                    map_403(url, e)
                 }
             }
         }
@@ -672,6 +902,8 @@ fn spawn_session(
     mut child: Child,
     proxy: Option<ProxyHandle>,
     extra: bool,
+    url: &str,
+    quality: &str,
 ) {
     let pid = child.id();
     if extra {
@@ -685,18 +917,35 @@ fn spawn_session(
         );
         kill_pid(old);
     }
-    if let Some(ref proxy) = proxy {
-        let app_log = app.clone();
-        let cb: Arc<dyn Fn(&str, String) + Send + Sync> = Arc::new(move |level, msg| {
-            log_vlc(&app_log, level, pid, msg);
-        });
-        let pending = {
-            let mut st = proxy.state.lock().unwrap();
-            st.on_log = Some(cb.clone());
-            std::mem::take(&mut st.pending_log)
-        };
-        for (level, msg) in pending {
-            cb(&level, msg);
+    let stream_id = state.stream_seq.fetch_add(1, Ordering::SeqCst);
+    state.streams.lock().unwrap().insert(
+        stream_id,
+        StreamSession {
+            id: stream_id,
+            url: url.to_string(),
+            quality: quality.to_string(),
+            pid: Some(pid),
+            status: "playing".into(),
+            proxy,
+        },
+    );
+    if let Some(dto) = patch_stream(app, stream_id, |_| {}) {
+        emit_stream(app, &dto);
+    }
+    if let Some(s) = state.streams.lock().unwrap().get_mut(&stream_id) {
+        if let Some(ref proxy) = s.proxy {
+            let app_log = app.clone();
+            let cb: Arc<dyn Fn(&str, String) + Send + Sync> = Arc::new(move |level, msg| {
+                log_vlc(&app_log, level, pid, msg);
+            });
+            let pending = {
+                let mut st = proxy.state.lock().unwrap();
+                st.on_log = Some(cb.clone());
+                std::mem::take(&mut st.pending_log)
+            };
+            for (level, msg) in pending {
+                cb(&level, msg);
+            }
         }
     }
     log_vlc(
@@ -723,9 +972,6 @@ fn spawn_session(
     thread::spawn(move || {
         let code = wait_for_vlc(&mut child, false);
         let _ = child.kill();
-        if let Some(p) = proxy {
-            p.shutdown();
-        }
         let st = app.state::<AppState>();
         {
             let mut primary = st.primary.lock().unwrap();
@@ -734,6 +980,10 @@ fn spawn_session(
             }
         }
         st.extras.lock().unwrap().retain(|p| *p != pid);
+        let removed = st.streams.lock().unwrap().remove(&stream_id);
+        if removed.is_some() {
+            let _ = app.emit("stream-removed", stream_id);
+        }
         log_vlc(&app, "debug", pid, format!("VLC pid={pid} exited {code}"));
         let _ = app.emit("player-stopped", pid);
     });
@@ -746,6 +996,51 @@ pub fn stop_cmd(app: AppHandle, state: State<AppState>) -> Result<(), String> {
         kill_pid(pid);
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn list_streams_cmd(state: State<AppState>) -> Vec<StreamDto> {
+    state
+        .streams
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| s.dto())
+        .collect()
+}
+
+#[tauri::command]
+pub fn stop_stream_cmd(app: AppHandle, id: u64) -> Result<(), String> {
+    let removed = app
+        .state::<AppState>()
+        .streams
+        .lock()
+        .unwrap()
+        .remove(&id);
+    let Some(s) = removed else {
+        return Err(format!("play: no stream {id}"));
+    };
+    if let Some(pid) = s.pid {
+        log_vlc(&app, "info", pid, format!("stop stream {id} pid={pid}"));
+        kill_pid(pid);
+    }
+    let st = app.state::<AppState>();
+    {
+        let mut primary = st.primary.lock().unwrap();
+        if *primary == s.pid {
+            *primary = None;
+        }
+    }
+    if let Some(pid) = s.pid {
+        st.extras.lock().unwrap().retain(|p| *p != pid);
+    }
+    let _ = app.emit("stream-removed", id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn stream_stats_cmd(state: State<AppState>) -> Vec<StreamDto> {
+    list_streams_cmd(state)
 }
 
 #[tauri::command]

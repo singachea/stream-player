@@ -10,7 +10,7 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["webRequest", "tabs", "storage"],
+  "permissions": ["webRequest", "tabs", "storage", "cookies"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1:17331/*"],
   "icons": {
     "32": "icons/32.png",

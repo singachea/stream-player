@@ -160,24 +160,58 @@ async function setBadge(tabId, n) {
   }
 }
 
+function siteOf(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function sameSite(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+}
+
+async function siteCookie(url) {
+  const site = siteOf(url);
+  if (!site) return "";
+  try {
+    const all = await chrome.cookies.getAll({});
+    const kept = all.filter((c) =>
+      sameSite(siteOf(`https://${c.domain.replace(/^\./, "")}`), site),
+    );
+    if (!kept.length) return "";
+    return kept.map((c) => `${c.name}=${c.value}`).join("; ");
+  } catch {
+    return "";
+  }
+}
+
 async function remember(tabId, url, extra) {
   if (!tabId || tabId < 0 || !url || !isHttpUrl(url) || isOurCapture(url)) return;
   const playUrl = resourceUrl(url);
+  const cookie = extra.cookie || (await siteCookie(playUrl));
   const map = await loadTab(tabId);
   const prev = map[playUrl] || { url: playUrl };
   const next = {
     url: playUrl,
+    seenAt: prev.seenAt || Date.now(),
     referer: extra.referer || prev.referer || extra.initiator || prev.initiator || "",
     initiator: extra.initiator || prev.initiator || extra.referer || prev.referer || "",
     origin: extra.origin || prev.origin || "",
     userAgent: extra.userAgent || prev.userAgent || "",
+    cookie: cookie || prev.cookie || "",
   };
   if (
     map[playUrl] &&
     map[playUrl].url === next.url &&
     map[playUrl].referer === next.referer &&
     map[playUrl].origin === next.origin &&
-    map[playUrl].userAgent === next.userAgent
+    map[playUrl].userAgent === next.userAgent &&
+    map[playUrl].cookie === next.cookie
   ) {
     return;
   }
