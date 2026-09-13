@@ -129,7 +129,22 @@ function add(value) {
 }
 
 async function sendToPlay(v, btn) {
-  const referer = v.referer || v.initiator || undefined;
+  // Prefer the actual player frame over the site root; fall back to the
+  // stored referer/initiator only when no frame URL was captured.
+  const referer = [v.frame, v.referer, v.initiator].find((u) => {
+    try {
+      return u && (u.startsWith("http://") || u.startsWith("https://"));
+    } catch {
+      return false;
+    }
+  });
+  const origin = v.origin || (() => {
+    try {
+      return new URL(referer || v.url).origin;
+    } catch {
+      return undefined;
+    }
+  })();
   const subtitles = [...items.values()]
     .filter((x) => isSub(x.url))
     .map((x) => x.url);
@@ -141,9 +156,10 @@ async function sendToPlay(v, btn) {
       body: JSON.stringify({
         url: v.url,
         referer,
-        origin: v.origin || undefined,
+        origin: origin || undefined,
         userAgent: v.userAgent || undefined,
         cookie: v.cookie || undefined,
+        cookieHost: v.cookieHost || undefined,
         subtitles: subtitles.length ? subtitles : undefined,
       }),
     });

@@ -290,6 +290,7 @@ pub struct ParsedCurl {
     pub origin: Option<String>,
     pub user_agent: Option<String>,
     pub cookie: Option<String>,
+    pub cookie_host: Option<String>,
     #[serde(default)]
     pub subtitles: Option<Vec<String>>,
 }
@@ -428,6 +429,7 @@ pub fn parse_curl(text: &str) -> Option<ParsedCurl> {
         origin,
         user_agent,
         cookie,
+        cookie_host: None,
         subtitles: None,
     })
 }
@@ -461,6 +463,7 @@ fn capture_from_pairs<'a>(
         origin,
         user_agent: None,
         cookie: None,
+        cookie_host: None,
         subtitles: None,
     })
 }
@@ -485,25 +488,30 @@ pub fn parse_capture_query(query: &str) -> Option<ParsedCurl> {
     capture_from_pairs(parsed.query_pairs())
 }
 
-/// JSON `{url, referer?, origin?, initiator?, userAgent?, cookie?, subtitles?}` from the extension POST.
+/// JSON `{url, referer?, frame?, origin?, initiator?, userAgent?, cookie?, cookieHost?, subtitles?}` from the extension POST.
 pub fn parse_capture_json(body: &str) -> Option<ParsedCurl> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Body {
         url: String,
         referer: Option<String>,
+        frame: Option<String>,
         origin: Option<String>,
         initiator: Option<String>,
         user_agent: Option<String>,
         cookie: Option<String>,
+        cookie_host: Option<String>,
         subtitles: Option<Vec<String>>,
     }
     let b: Body = serde_json::from_str(body.trim()).ok()?;
     let url = http_https(&b.url)?;
+    // Prefer the actual player frame over the site root: some CDNs
+    // allowlist the exact embed path.
     let referer = b
-        .referer
+        .frame
         .as_deref()
         .and_then(http_https)
+        .or_else(|| b.referer.as_deref().and_then(http_https))
         .or_else(|| b.initiator.as_deref().and_then(http_https));
     let origin = b.origin.as_deref().and_then(http_https);
     let user_agent = b
@@ -513,6 +521,12 @@ pub fn parse_capture_json(body: &str) -> Option<ParsedCurl> {
     let cookie = b
         .cookie
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Host that owned the request the cookie was read from. Exact-request
+    // cookies must be replayed even cross-site.
+    let cookie_host = b
+        .cookie_host
+        .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
     let subtitles = b.subtitles.map(|v| {
         v.into_iter()
@@ -529,6 +543,7 @@ pub fn parse_capture_json(body: &str) -> Option<ParsedCurl> {
         origin,
         user_agent,
         cookie,
+        cookie_host,
         subtitles,
     })
 }
@@ -662,6 +677,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_capture_json_frame_beats_root() {
+        let p = parse_capture_json(
+            r#"{"url":"https://cdn.example/a.m3u8","referer":"https://embed.example/","frame":"https://embed.example/player/abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.referer.as_deref(),
+            Some("https://embed.example/player/abc")
+        );
+        let p = parse_capture_json(
+            r#"{"url":"https://cdn.example/a.m3u8","referer":"https://embed.example/"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.referer.as_deref(), Some("https://embed.example/"));
+    }
+
+    #[test]
     fn test_parse_capture_json_initiator() {
         let p = parse_capture_json(
             r#"{"url":"https://cdn.example/a.m3u8","initiator":"https://embed.example/"}"#,
@@ -674,10 +706,11 @@ mod tests {
     #[test]
     fn test_parse_capture_json_cookie_and_ua() {
         let p = parse_capture_json(
-            r#"{"url":"https://embed.example/wrap/token.m3u8","referer":"https://embed.example/watch/1","origin":"https://embed.example","userAgent":"Mozilla/5.0 Test","cookie":"sid=abc; other=1"}"#,
+            r#"{"url":"https://embed.example/wrap/token.m3u8","referer":"https://embed.example/watch/1","origin":"https://embed.example","userAgent":"Mozilla/5.0 Test","cookie":"sid=abc; other=1","cookieHost":"embed.example"}"#,
         )
         .unwrap();
         assert_eq!(p.cookie.as_deref(), Some("sid=abc; other=1"));
+        assert_eq!(p.cookie_host.as_deref(), Some("embed.example"));
         assert_eq!(p.user_agent.as_deref(), Some("Mozilla/5.0 Test"));
         assert_eq!(p.origin.as_deref(), Some("https://embed.example"));
     }

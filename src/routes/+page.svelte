@@ -26,6 +26,7 @@
   let origin = $state("");
   let userAgent = $state("");
   let cookie = $state("");
+  let cookieHost = $state("");
   let advancedOpen = $state(false);
   let workdir = $state("");
   let variants = $state<Variant[]>([]);
@@ -87,6 +88,7 @@
       origin: orig,
       userAgent: userAgent.trim() || null,
       cookie: cookie.trim() || null,
+      cookieHost: cookieHost.trim().toLowerCase() || null,
     };
   });
 
@@ -404,6 +406,7 @@
     url = parsed.url;
     subtitles = (parsed.subtitles || []).filter((s) => /^https?:\/\//i.test(s));
     cookie = parsed.cookie || "";
+    cookieHost = (parsed.cookieHost || "").toLowerCase();
     if (parsed.referer) {
       referer = parsed.referer;
       origin = parsed.origin || "";
@@ -438,6 +441,7 @@
     subtitles = [];
     applyRefererForUrl(next);
     cookie = "";
+    cookieHost = "";
     addLog("info", `pasted ${next.length} chars`);
     return true;
   }

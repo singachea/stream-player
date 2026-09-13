@@ -118,13 +118,18 @@ fn same_site(a: &str, b: &str) -> bool {
 
 /// Same-origin GET (browser omits Origin). Cross-origin CORS Origin is sent.
 /// First-party Cookie is sent only to a same-site host (subdomains included);
-/// cross-site cookies are dropped.
+/// cross-site cookies are dropped — except an `X-Play-Cookie-Host` marker,
+/// which proves the cookie came from the player's own request headers.
 pub(crate) fn omit_curl_header(
     name: &str,
     value: &str,
     url: &str,
     headers: &HashMap<String, String>,
 ) -> bool {
+    if name.eq_ignore_ascii_case("x-play-cookie-host") {
+        // Internal marker, never sent on the wire.
+        return true;
+    }
     let v = sanitize_header_value(value);
     if v.is_empty() {
         return true;
@@ -133,6 +138,16 @@ pub(crate) fn omit_curl_header(
         return true;
     }
     if name.eq_ignore_ascii_case("cookie") {
+        if let Some(marker) = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-play-cookie-host"))
+            .map(|(_, val)| val.as_str())
+        {
+            let uh = host_of_url(url);
+            if same_site(&uh, &marker.to_lowercase()) {
+                return false;
+            }
+        }
         let referer = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
@@ -1025,6 +1040,27 @@ Terms of Service violations.The affected zone is cdn.example.",
             "Cookie",
             "sid=1",
             "https://cdn.embed.example/master.m3u8",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn test_exact_request_cookie_survives_cross_site() {
+        let headers = HashMap::from([
+            ("Referer".into(), "https://embed.example/watch/1".into()),
+            ("Cookie".into(), "sid=1".into()),
+            ("X-Play-Cookie-Host".into(), "cdn.example".into()),
+        ]);
+        assert!(!omit_curl_header(
+            "Cookie",
+            "sid=1",
+            "https://cdn.example/master.m3u8",
+            &headers
+        ));
+        assert!(omit_curl_header(
+            "X-Play-Cookie-Host",
+            "cdn.example",
+            "https://cdn.example/master.m3u8",
             &headers
         ));
     }

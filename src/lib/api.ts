@@ -6,6 +6,7 @@ export type HeaderOpts = {
   origin?: string | null;
   userAgent?: string | null;
   cookie?: string | null;
+  cookieHost?: string | null;
 };
 
 export type ParsedCurl = {
@@ -14,6 +15,7 @@ export type ParsedCurl = {
   origin?: string | null;
   userAgent?: string | null;
   cookie?: string | null;
+  cookieHost?: string | null;
   subtitles?: string[] | null;
 };
 
@@ -59,6 +61,7 @@ export function resolve(
     origin: opts.origin ?? null,
     userAgent: opts.userAgent ?? null,
     cookie: opts.cookie ?? null,
+    cookieHost: opts.cookieHost ?? null,
   });
 }
 
@@ -74,6 +77,7 @@ export function play(
     origin: opts.origin ?? null,
     userAgent: opts.userAgent ?? null,
     cookie: opts.cookie ?? null,
+    cookieHost: opts.cookieHost ?? null,
     extra: opts.extra ?? false,
     subtitles: opts.subtitles ?? null,
   });
@@ -123,6 +127,7 @@ export function download(
     origin: opts.origin ?? null,
     userAgent: opts.userAgent ?? null,
     cookie: opts.cookie ?? null,
+    cookieHost: opts.cookieHost ?? null,
   });
 }
 
@@ -144,6 +149,7 @@ export function retryJob(
     origin: opts.origin ?? null,
     userAgent: opts.userAgent ?? null,
     cookie: opts.cookie ?? null,
+    cookieHost: opts.cookieHost ?? null,
   });
 }
 

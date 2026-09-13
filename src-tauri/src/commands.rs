@@ -233,6 +233,11 @@ pub fn ingest_capture(app: &AppHandle, capture: ParsedCurl) {
         .as_deref()
         .map(|r| format!(" Referer={r}"))
         .unwrap_or_default();
+    let cookie = if capture.cookie.as_deref().is_some_and(|c| !c.is_empty()) {
+        " cookie=yes"
+    } else {
+        ""
+    };
     let subs = capture
         .subtitles
         .as_ref()
@@ -241,7 +246,7 @@ pub fn ingest_capture(app: &AppHandle, capture: ParsedCurl) {
     log(
         app,
         "info",
-        format!("capture {}{extra}{subs}", capture.url),
+        format!("capture {}{extra}{cookie}{subs}", capture.url),
     );
     let _ = app.emit("play-open", &capture);
     if let Some(w) = app.get_webview_window("main") {
@@ -395,6 +400,7 @@ fn load_headers(
     origin: Option<&str>,
     user_agent: Option<&str>,
     cookie: Option<&str>,
+    cookie_host: Option<&str>,
 ) -> Result<(HashMap<String, String>, Prefs, PathBuf), Error> {
     let path = prefs_path(dir);
     let prefs = load_prefs(&path)?;
@@ -408,6 +414,12 @@ fn load_headers(
     let mut headers = http_headers(&cfg["user_agent"], &cfg["referer"], &cfg["origin"]);
     if let Some(c) = cookie.map(str::trim).filter(|s| !s.is_empty()) {
         headers.insert("Cookie".into(), c.to_string());
+        // Exact-request cookies (read from the player's own request
+        // headers) must be replayed even cross-site; the cookie jar
+        // fallback stays same-site only.
+        if let Some(h) = cookie_host.map(str::trim).filter(|s| !s.is_empty()) {
+            headers.insert("X-Play-Cookie-Host".into(), h.to_lowercase());
+        }
     }
     Ok((headers, prefs, path))
 }
@@ -518,11 +530,12 @@ pub async fn resolve_cmd(
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    cookie_host: Option<String>,
 ) -> Result<ResolveResponse, String> {
     let app2 = app.clone();
     let dir = workdir(&app, &state);
     tauri::async_runtime::spawn_blocking(move || {
-        resolve_blocking(&app2, &dir, &url, referer, origin, user_agent, cookie)
+        resolve_blocking(&app2, &dir, &url, referer, origin, user_agent, cookie, cookie_host)
     })
     .await
     .map_err(|e| format!("play: resolve task failed: {e}"))?
@@ -536,6 +549,7 @@ fn resolve_blocking(
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    cookie_host: Option<String>,
 ) -> Result<ResolveResponse, String> {
     let (headers, _prefs, _path) = load_headers(
         url,
@@ -544,6 +558,7 @@ fn resolve_blocking(
         origin.as_deref(),
         user_agent.as_deref(),
         cookie.as_deref(),
+        cookie_host.as_deref(),
     )
     .map_err(err_str)?;
     let kind = detect_kind(url);
@@ -644,6 +659,7 @@ pub async fn play_cmd(
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    cookie_host: Option<String>,
     extra: Option<bool>,
     subtitles: Option<Vec<String>>,
     prefetch_count: Option<usize>,
@@ -660,6 +676,7 @@ pub async fn play_cmd(
             origin,
             user_agent,
             cookie,
+            cookie_host,
             extra,
             subtitles,
             prefetch_count,
@@ -742,6 +759,7 @@ fn play_blocking(
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    cookie_host: Option<String>,
     extra: Option<bool>,
     subtitles: Option<Vec<String>>,
     prefetch_count: Option<usize>,
@@ -762,6 +780,7 @@ fn play_blocking(
         origin.as_deref(),
         user_agent.as_deref(),
         cookie.as_deref(),
+        cookie_host.as_deref(),
     )
     .map_err(err_str)?;
     let kind = detect_kind(url);
@@ -1320,6 +1339,7 @@ pub fn download_cmd(
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    cookie_host: Option<String>,
 ) -> Result<JobDto, String> {
     let dir = workdir(&app, &state);
     let (headers, _prefs, _path) = load_headers(
@@ -1329,6 +1349,7 @@ pub fn download_cmd(
         origin.as_deref(),
         user_agent.as_deref(),
         cookie.as_deref(),
+        cookie_host.as_deref(),
     )
     .map_err(err_str)?;
     let n = workers(&app, &state);
@@ -1368,6 +1389,7 @@ pub fn retry_job_cmd(
     origin: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    cookie_host: Option<String>,
 ) -> Result<JobDto, String> {
     let (url, dest, quality) = {
         let jobs = state.jobs.lock().unwrap();
@@ -1387,6 +1409,7 @@ pub fn retry_job_cmd(
         origin.as_deref(),
         user_agent.as_deref(),
         cookie.as_deref(),
+        cookie_host.as_deref(),
     )
     .map_err(err_str)?;
     let n = workers(&app, &state);

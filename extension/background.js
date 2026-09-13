@@ -160,6 +160,14 @@ async function setBadge(tabId, n) {
   }
 }
 
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
 function siteOf(url) {
   try {
     const u = new URL(url);
@@ -190,20 +198,52 @@ async function siteCookie(url) {
   }
 }
 
-async function remember(tabId, url, extra) {
+async function frameUrl(tabId, frameId) {
+  if (!tabId || tabId < 0 || frameId == null || frameId < 0) return "";
+  try {
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId });
+    const url = frame?.url || "";
+    return isHttpUrl(url) ? url : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Longest URL wins: the player iframe/embed path beats the site root. */
+function pickReferer(...candidates) {
+  const http = candidates.filter((u) => u && isHttpUrl(u));
+  if (!http.length) return "";
+  return http.sort((a, b) => b.length - a.length)[0];
+}
+
+async function remember(tabId, url, extra, frameId) {
   if (!tabId || tabId < 0 || !url || !isHttpUrl(url) || isOurCapture(url)) return;
   const playUrl = resourceUrl(url);
-  const cookie = extra.cookie || (await siteCookie(playUrl));
+  const frame = (await frameUrl(tabId, frameId)) || "";
+  // Cookie source: the exact request header first, then the jar keyed by
+  // the stream host. Either way the cookie belongs to the stream host, so
+  // record the owner: the app replays cross-site and must not drop it.
+  const jarCookie = extra.cookie ? "" : ((await siteCookie(url)) || (await siteCookie(playUrl)));
   const map = await loadTab(tabId);
   const prev = map[playUrl] || { url: playUrl };
+  const cookie = extra.cookie || jarCookie || prev.cookie || "";
+  const cookieHost = cookie ? (siteOf(playUrl) || prev.cookieHost || "") : "";
+  // Ground truth first: the Referer the player actually sent. The frame URL
+  // is only a fallback when the header is missing or trimmed to the origin.
+  const referer = [extra.referer, frame, extra.initiator, prev.referer, prev.initiator]
+    .find((u) => u && isHttpUrl(u)) || "";
+  const origin = [extra.origin, frame && originOf(frame), prev.origin]
+    .filter((u) => u && u.startsWith("http"))[0] || "";
   const next = {
     url: playUrl,
     seenAt: prev.seenAt || Date.now(),
-    referer: extra.referer || prev.referer || extra.initiator || prev.initiator || "",
+    referer,
     initiator: extra.initiator || prev.initiator || extra.referer || prev.referer || "",
-    origin: extra.origin || prev.origin || "",
+    origin: origin || prev.origin || "",
     userAgent: extra.userAgent || prev.userAgent || "",
-    cookie: cookie || prev.cookie || "",
+    cookie,
+    cookieHost,
+    frame: frame || prev.frame || "",
   };
   if (
     map[playUrl] &&
@@ -211,7 +251,9 @@ async function remember(tabId, url, extra) {
     map[playUrl].referer === next.referer &&
     map[playUrl].origin === next.origin &&
     map[playUrl].userAgent === next.userAgent &&
-    map[playUrl].cookie === next.cookie
+    map[playUrl].cookie === next.cookie &&
+    map[playUrl].cookieHost === next.cookieHost &&
+    map[playUrl].frame === next.frame
   ) {
     return;
   }
@@ -237,8 +279,11 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       referer: header(d.requestHeaders, "referer"),
       origin: header(d.requestHeaders, "origin"),
       userAgent: header(d.requestHeaders, "user-agent"),
+      // The exact Cookie the player sent (SameSite=None cookies included).
+      // Falls back to a same-site lookup inside remember() when hidden.
+      cookie: header(d.requestHeaders, "cookie"),
       initiator: d.initiator,
-    });
+    }, d.frameId);
   },
   { urls: ["<all_urls>"] },
   ["requestHeaders", "extraHeaders"],
@@ -257,7 +302,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!isCaptureUrl(d.url) && !playlist && !isMediaType(d.responseHeaders)) {
       return;
     }
-    remember(d.tabId, d.url, { initiator: d.initiator });
+    remember(d.tabId, d.url, { initiator: d.initiator }, d.frameId);
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"],
