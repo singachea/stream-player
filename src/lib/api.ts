@@ -68,7 +68,7 @@ export function resolve(
 export function play(
   url: string,
   quality?: string | null,
-  opts: HeaderOpts & { extra?: boolean; subtitles?: string[] } = {},
+  opts: HeaderOpts & { extra?: boolean; subtitles?: string[]; subtitle?: string | null } = {},
 ): Promise<ResolveResponse> {
   return invoke("play_cmd", {
     url,
@@ -80,6 +80,7 @@ export function play(
     cookieHost: opts.cookieHost ?? null,
     extra: opts.extra ?? false,
     subtitles: opts.subtitles ?? null,
+    subtitle: opts.subtitle ?? null,
   });
 }
 

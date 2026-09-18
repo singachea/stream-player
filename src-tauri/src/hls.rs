@@ -87,6 +87,79 @@ pub fn parse_subtitle_tracks(playlist: &str, base_url: &str) -> Vec<SubtitleTrac
     out
 }
 
+/// Label shown in the subtitle picker, e.g. "English (en)".
+pub fn subtitle_label(t: &SubtitleTrack) -> String {
+    let lang = t.language.trim();
+    if lang.is_empty() || t.name.eq_ignore_ascii_case(lang) {
+        t.name.clone()
+    } else {
+        format!("{} ({lang})", t.name)
+    }
+}
+
+fn subtitle_rank(t: &SubtitleTrack) -> (u8, u8) {
+    let lang = t.language.to_ascii_lowercase();
+    let name = t.name.to_ascii_lowercase();
+    let english = lang == "en"
+        || lang.starts_with("en-")
+        || lang.starts_with("eng")
+        || name == "english"
+        || name.starts_with("english ");
+    let flagged = u8::from(!t.default);
+    (flagged, u8::from(!english))
+}
+
+/// Id of the picked subtitle, or None for off. Empty/off picks None; "auto"
+/// prefers the playlist default, then English, then the first track.
+pub fn pick_subtitle(tracks: &[SubtitleTrack], choice: Option<&str>) -> Option<usize> {
+    if tracks.is_empty() {
+        return None;
+    }
+    match choice.map(str::trim).unwrap_or("auto") {
+        s if s.is_empty() || s.eq_ignore_ascii_case("off") || s == "-1" => None,
+        s if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("default") => {
+            preferred_subtitle(tracks)
+        }
+        s => {
+            if let Ok(n) = s.parse::<usize>() {
+                if n < tracks.len() {
+                    return Some(n);
+                }
+            }
+            let want = s.to_ascii_lowercase();
+            tracks
+                .iter()
+                .position(|t| {
+                    t.name.eq_ignore_ascii_case(s)
+                        || t.language.eq_ignore_ascii_case(s)
+                        || subtitle_label(t).eq_ignore_ascii_case(s)
+                        || t.language.to_ascii_lowercase() == want
+                        || t.name.to_ascii_lowercase() == want
+                })
+                .or_else(|| preferred_subtitle(tracks))
+        }
+    }
+}
+
+fn preferred_subtitle(tracks: &[SubtitleTrack]) -> Option<usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, t)| subtitle_rank(t))
+        .map(|(i, _)| i)
+}
+
+/// Keep only the picked subtitle track, or none when off.
+pub fn filter_subtitles(
+    tracks: Vec<SubtitleTrack>,
+    choice: Option<&str>,
+) -> Vec<SubtitleTrack> {
+    match pick_subtitle(&tracks, choice) {
+        Some(i) => tracks.into_iter().nth(i).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
 fn subtitle_path(url: &str) -> String {
     let Ok(parsed) = url::Url::parse(url) else {
         return url.to_ascii_lowercase();
@@ -679,6 +752,46 @@ index.m3u8
         assert!(master.contains(r#"URI="http://127.0.0.1/sub/0.m3u8""#));
         assert!(master.contains(r#"SUBTITLES="subs""#));
         assert!(master.contains("http://127.0.0.1/index.m3u8"));
+    }
+
+    fn sample_sub_tracks() -> Vec<SubtitleTrack> {
+        vec![
+            SubtitleTrack {
+                name: "Spanish".into(),
+                language: "es".into(),
+                url: "https://cdn.example/es.m3u8".into(),
+                default: false,
+            },
+            SubtitleTrack {
+                name: "English".into(),
+                language: "en".into(),
+                url: "https://cdn.example/en.m3u8".into(),
+                default: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_pick_subtitle_auto_prefers_english() {
+        let tracks = sample_sub_tracks();
+        assert_eq!(pick_subtitle(&tracks, None), Some(1));
+        assert_eq!(pick_subtitle(&tracks, Some("auto")), Some(1));
+        assert_eq!(pick_subtitle(&tracks, Some("off")), None);
+        assert_eq!(pick_subtitle(&tracks, Some("0")), Some(0));
+        assert_eq!(pick_subtitle(&tracks, Some("es")), Some(0));
+        assert_eq!(pick_subtitle(&tracks, Some("Spanish")), Some(0));
+    }
+
+    #[test]
+    fn test_pick_subtitle_respects_playlist_default() {
+        let mut tracks = sample_sub_tracks();
+        tracks[0].default = true;
+        assert_eq!(pick_subtitle(&tracks, None), Some(0));
+        let one = filter_subtitles(tracks.clone(), Some("off"));
+        assert!(one.is_empty());
+        let one = filter_subtitles(tracks, None);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].language, "es");
     }
 
     #[test]
