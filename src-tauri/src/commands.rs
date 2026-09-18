@@ -81,10 +81,15 @@ pub struct StreamDto {
     pub quality: String,
     pub status: String,
     pub pid: Option<u32>,
-    /// Highest segment index VLC has requested (playhead).
+    /// Last segment index VLC requested (playhead). Seeks move it.
     pub playhead: Option<usize>,
-    /// Segments cached ahead of the playhead.
+    /// Contiguous cached segments right after the playhead.
     pub buffered: usize,
+    /// Cached/uncached flags for the next 10% window after the playhead,
+    /// sampled into 20 pieces (each piece is 0.5% of the playlist).
+    pub window: Vec<bool>,
+    pub window_start: Option<usize>,
+    pub window_len: usize,
     pub total: usize,
     pub cached_bytes: u64,
     pub served: u64,
@@ -92,32 +97,48 @@ pub struct StreamDto {
 
 impl StreamSession {
     fn dto(&self) -> StreamDto {
-        let (playhead, buffered, total, cached_bytes, served) = match &self.proxy {
-            Some(p) => {
-                let st = p.state.lock().unwrap();
-                let total = st.segments.len();
-                let playhead = st.served_max;
-                // Contiguous cached run ahead of the playhead. Sparse
-                // entries past a gap do not count: VLC cannot play them yet.
-                let start = playhead.map_or(0, |h| h + 1);
-                let mut buffered = 0;
-                for n in start..total {
-                    if st.seg_cache.contains_key(&n) {
-                        buffered += 1;
-                    } else {
-                        break;
+        let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
+            match &self.proxy {
+                Some(p) => {
+                    let st = p.state.lock().unwrap();
+                    let total = st.segments.len();
+                    let playhead = st.served_cur;
+                    // Contiguous cached run ahead of the playhead. Sparse
+                    // entries past a gap do not count: VLC cannot play them yet.
+                    let start = playhead.map_or(0, |h| h + 1);
+                    let mut buffered = 0;
+                    for n in start..total {
+                        if st.seg_cache.contains_key(&n) {
+                            buffered += 1;
+                        } else {
+                            break;
+                        }
                     }
+                    // Next 10% window after the playhead, sampled into 20
+                    // pieces (0.5% each). A piece is filled when any segment
+                    // in its slice is cached. Gaps stay visible until the
+                    // fetcher fills them in order.
+                    let want = crate::proxy::readahead_window(total, start);
+                    let window_start = (want > 0).then_some(start);
+                    let mut window = Vec::new();
+                    for i in 0..20 {
+                        let lo = start + (want * i) / 20;
+                        let hi = start + (want * (i + 1)) / 20;
+                        window.push(lo < hi && (lo..hi).any(|n| st.seg_cache.contains_key(&n)));
+                    }
+                    (
+                        playhead,
+                        buffered,
+                        window,
+                        window_start,
+                        want,
+                        total,
+                        st.cached_bytes,
+                        st.served_count,
+                    )
                 }
-                (
-                    playhead,
-                    buffered,
-                    total,
-                    st.cached_bytes,
-                    st.served_count,
-                )
-            }
-            None => (None, 0, 0, 0, 0),
-        };
+                None => (None, 0, Vec::new(), None, 0, 0, 0, 0),
+            };
         StreamDto {
             id: self.id,
             url: self.url.clone(),
@@ -127,6 +148,9 @@ impl StreamSession {
             pid: self.pid,
             playhead,
             buffered,
+            window,
+            window_start,
+            window_len,
             total,
             cached_bytes,
             served,

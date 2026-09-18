@@ -2,8 +2,21 @@ const PLAY_OPEN = "http://127.0.0.1:17331/open";
 
 const statusEl = document.getElementById("status");
 const listEl = document.getElementById("list");
+const clearEl = document.getElementById("clear");
 const items = new Map();
 let tabId = null;
+
+clearEl.addEventListener("click", async () => {
+  items.clear();
+  render();
+  setStatus("Watching…");
+  if (tabId == null) return;
+  try {
+    await chrome.runtime.sendMessage({ cmd: "clear", tabId });
+  } catch {
+    /* background unreachable; local list already cleared */
+  }
+});
 
 function setStatus(text, isErr) {
   statusEl.textContent = text;
@@ -78,16 +91,18 @@ function formatTime(seenAt) {
 }
 
 function render() {
-  const rows = [...items.values()].sort((a, b) => rank(a.url) - rank(b.url));
+  const rows = [...items.values()].sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0));
   if (!rows.length) {
     listEl.innerHTML =
       '<div class="empty">No streams on this tab yet. Reload the page, play the video, and watch the badge. Then click here.</div>';
     return;
   }
+  // Highlight only the latest fetch group.
+  const latest = rows.reduce((m, v) => Math.max(m, v.batch || 0), 0);
   listEl.replaceChildren();
   for (const [i, v] of rows.entries()) {
     const row = document.createElement("div");
-    row.className = "item";
+    row.className = "item" + (latest && v.batch === latest ? " fresh" : "");
     const idx = document.createElement("div");
     idx.className = "idx";
     idx.textContent = String(i + 1);

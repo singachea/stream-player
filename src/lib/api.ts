@@ -96,6 +96,9 @@ export interface StreamSession {
   pid?: number | null;
   playhead?: number | null;
   buffered: number;
+  window: boolean[];
+  windowStart?: number | null;
+  windowLen: number;
   total: number;
   cachedBytes: number;
   served: number;

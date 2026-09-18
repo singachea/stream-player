@@ -22,7 +22,10 @@ pub struct ProxyState {
     /// Prefetched segment bodies by index. Filled before VLC launches when
     /// buffer-first is on, so slow remotes start with a cushion.
     pub seg_cache: HashMap<usize, Vec<u8>>,
-    /// Highest segment index VLC has requested. Used as the playhead.
+    /// Last segment index VLC requested. Tracks the current position;
+    /// seeking back moves this backward so the fetch window follows.
+    pub served_cur: Option<usize>,
+    /// Highest segment index VLC has requested. Kept for stats only.
     pub served_max: Option<usize>,
     /// Total segment requests served to VLC.
     pub served_count: u64,
@@ -105,6 +108,7 @@ pub fn start_proxy(
         segments,
         files: HashMap::new(),
         seg_cache: HashMap::new(),
+        served_cur: None,
         served_max: None,
         served_count: 0,
         cached_bytes: 0,
@@ -235,9 +239,9 @@ fn stop_flag(handle: &ProxyHandle) -> bool {
 }
 
 /// After serving a segment, keep 10% of the whole playlist cached ahead
-/// of the playhead. A 789-segment playlist keeps ~79 ahead from any seek
-/// point. Runs in the background; seeks just move the playhead and the
-/// window follows.
+/// of the current position. A 789-segment playlist keeps ~79 ahead from
+/// any seek point. Runs in the background; each request re-anchors the
+/// window at the latest segment VLC asked for, so seeks move the window.
 fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
     let (segments, headers, start, total) = {
         let st = state.lock().unwrap();
@@ -245,7 +249,7 @@ fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
         if total == 0 {
             return;
         }
-        let start = st.served_max.map_or(0, |h| h + 1);
+        let start = st.served_cur.map_or(0, |c| c + 1);
         (st.segments.clone(), st.headers.clone(), start, total)
     };
     let want = readahead_window(total, start);
@@ -268,7 +272,7 @@ fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
 
 /// Segments to keep cached ahead: 10% of the whole playlist from the
 /// playhead, capped by what remains. At least 1 while anything remains.
-fn readahead_window(total: usize, start: usize) -> usize {
+pub(crate) fn readahead_window(total: usize, start: usize) -> usize {
     let remaining = total.saturating_sub(start);
     if remaining == 0 {
         return 0;
@@ -460,9 +464,11 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
             let mut st = state.lock().unwrap();
             if let Some(cached) = st.seg_cache.get(&idx).cloned() {
                 st.served_count += 1;
+                st.served_cur = Some(idx);
                 st.served_max = Some(st.served_max.map_or(idx, |m| m.max(idx)));
                 drop(st);
                 respond_segment(request, &cached, rest);
+                trigger_readahead(state.clone(), stop.clone());
                 return;
             }
             let src = match st.segments.get(idx) {
@@ -515,6 +521,7 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
                     st.cached_bytes += body.len() as u64;
                     st.seg_cache.insert(idx, body.clone());
                     st.served_count += 1;
+                    st.served_cur = Some(idx);
                     st.served_max = Some(st.served_max.map_or(idx, |m| m.max(idx)));
                 }
                 respond_segment(request, &body, rest);

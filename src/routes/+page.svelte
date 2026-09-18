@@ -364,6 +364,24 @@
     return true;
   }
 
+  function applyPlayResult(res: Awaited<ReturnType<typeof api.play>>) {
+    if (res.status === "needReferer") {
+      needReferer = res;
+      return false;
+    }
+    kind = res.kind;
+    if (res.variants.length) {
+      variants = res.variants;
+      if (!variants.some((v) => v.quality === quality)) {
+        quality = variants[0].quality;
+      }
+    } else if (res.kind !== "hls") {
+      variants = [];
+      quality = "best";
+    }
+    return true;
+  }
+
   let resolveGen = 0;
   let resolveTimer: number | undefined;
 
@@ -518,7 +536,7 @@
         subtitles,
       });
       pendingAfterReferer = "play";
-      if (!applyResolve(res)) return;
+      if (!applyPlayResult(res)) return;
       playing = true;
       if (extra) extraCount += 1;
       else extraCount = Math.max(1, extraCount);
@@ -845,7 +863,7 @@
 
       {#if variants.length > 0}
         <div class="mt-3 flex flex-wrap gap-1.5">
-          {#each variants as v, i (v.quality + String(v.bandwidth))}
+          {#each variants as v (v.quality + String(v.bandwidth))}
             <button
               type="button"
               class="rounded-full border px-3 py-1 text-xs font-medium {quality ===
@@ -857,9 +875,7 @@
                 addLog("debug", `quality ${v.label}`);
               }}
             >
-              {v.label}{#if i === 0}
-                <span class="text-surface-500"> default</span>
-              {/if}
+              {v.label}
             </button>
           {/each}
         </div>

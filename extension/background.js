@@ -132,6 +132,29 @@ function tabKey(tabId) {
   return `tab:${tabId}`;
 }
 
+/** URLs seen within this gap belong to the same fetch group. */
+const BATCH_GAP_MS = 5000;
+
+/** Batch for a newly discovered URL: reuse the latest batch when the
+ *  previous discovery is still fresh, otherwise start a new group. */
+function nextBatch(map) {
+  let maxSeen = 0;
+  let maxBatch = 0;
+  for (const v of Object.values(map)) {
+    if (v?.seenAt > maxSeen) maxSeen = v.seenAt;
+    if (v?.batch > maxBatch) maxBatch = v.batch;
+  }
+  if (!maxBatch) {
+    // Backfill entries stored before batching existed.
+    maxBatch = 1;
+    for (const v of Object.values(map)) {
+      if (v && !v.batch) v.batch = 1;
+    }
+    return Date.now() - maxSeen <= BATCH_GAP_MS ? 1 : 2;
+  }
+  return Date.now() - maxSeen <= BATCH_GAP_MS ? maxBatch : maxBatch + 1;
+}
+
 async function loadTab(tabId) {
   const key = tabKey(tabId);
   const data = await chrome.storage.session.get(key);
@@ -237,6 +260,9 @@ async function remember(tabId, url, extra, frameId) {
   const next = {
     url: playUrl,
     seenAt: prev.seenAt || Date.now(),
+    // Group URLs discovered in the same burst so the popup can highlight
+    // only the latest fetch group. New URLs within the gap share a batch.
+    batch: prev.batch || nextBatch(map),
     referer,
     initiator: extra.initiator || prev.initiator || extra.referer || prev.referer || "",
     origin: origin || prev.origin || "",
@@ -260,7 +286,11 @@ async function remember(tabId, url, extra, frameId) {
   map[playUrl] = next;
   const keys = Object.keys(map);
   if (keys.length > 50) {
-    for (const k of keys.slice(0, keys.length - 50)) delete map[k];
+    // Drop the oldest discoveries first so the latest fetch group survives.
+    keys
+      .sort((a, b) => (map[a]?.seenAt || 0) - (map[b]?.seenAt || 0))
+      .slice(0, keys.length - 50)
+      .forEach((k) => delete map[k]);
   }
   await saveTab(tabId, map);
   await setBadge(tabId, Object.keys(map).length);
@@ -323,6 +353,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     loadTab(msg.tabId)
       .then((map) => respond({ playlists: Object.values(map) }))
       .catch(() => respond({ playlists: [] }));
+    return true;
+  }
+  if (msg?.cmd === "clear") {
+    clearTab(msg.tabId)
+      .then(() => respond({ ok: true }))
+      .catch(() => respond({ ok: false }));
     return true;
   }
 });
