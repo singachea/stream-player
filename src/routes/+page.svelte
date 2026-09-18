@@ -11,6 +11,7 @@
     LogFilter,
     LogLine,
     NeedReferer,
+    Subtitle,
     Variant,
   } from "$lib/types";
   import { formatLogLine, matchLog } from "$lib/log";
@@ -31,6 +32,8 @@
   let workdir = $state("");
   let variants = $state<Variant[]>([]);
   let quality = $state<string>("best");
+  let subTracks = $state<Subtitle[]>([]);
+  let subtitle = $state<string>("auto");
   let kind = $state("hls");
   let hosts = $state<HostRow[]>([]);
   let busy = $state(false);
@@ -350,6 +353,24 @@
     }
   }
 
+  const subtitleOptions = $derived.by(() => {
+    const opts = subTracks.map((t, i) => ({ id: String(i), label: t.label }));
+    if (!subTracks.length) return opts;
+    return [{ id: "auto", label: "Auto (English preferred)" }, ...opts, { id: "off", label: "Off" }];
+  });
+
+  function applySubtitles(incoming: Subtitle[]) {
+    subTracks = incoming;
+    if (!subTracks.length) {
+      subtitle = "auto";
+      return;
+    }
+    if (subtitle !== "auto" && subtitle !== "off") {
+      const n = Number(subtitle);
+      if (!Number.isInteger(n) || n < 0 || n >= subTracks.length) subtitle = "auto";
+    }
+  }
+
   function applyResolve(res: Awaited<ReturnType<typeof api.resolve>>) {
     if (res.status === "needReferer") {
       needReferer = res;
@@ -357,10 +378,31 @@
     }
     kind = res.kind;
     variants = res.variants;
+    applySubtitles(res.subtitles || []);
     if (variants.length && !variants.some((v) => v.quality === quality)) {
       quality = variants[0].quality;
     }
     if (!variants.length) quality = "best";
+    return true;
+  }
+
+  function applyPlayResult(res: Awaited<ReturnType<typeof api.play>>) {
+    if (res.status === "needReferer") {
+      needReferer = res;
+      return false;
+    }
+    kind = res.kind;
+    if (res.variants.length) {
+      variants = res.variants;
+      if (!variants.some((v) => v.quality === quality)) {
+        quality = variants[0].quality;
+      }
+    } else if (res.kind !== "hls") {
+      variants = [];
+      quality = "best";
+    }
+    if ((res.subtitles || []).length) applySubtitles(res.subtitles || []);
+    else if (res.kind !== "hls") applySubtitles([]);
     return true;
   }
 
@@ -372,6 +414,8 @@
     const u = cleanUrl(url);
     if (!looksLikeUrl(u)) {
       variants = [];
+      subTracks = [];
+      subtitle = "auto";
       return;
     }
     resolveTimer = window.setTimeout(() => void autoResolve(), 450);
@@ -394,6 +438,8 @@
       if (gen !== resolveGen) return;
       addLog("error", String(e));
       variants = [];
+      subTracks = [];
+      subtitle = "auto";
     } finally {
       if (gen === resolveGen) resolving = false;
     }
@@ -416,7 +462,6 @@
     }
     if (parsed.userAgent) {
       userAgent = parsed.userAgent;
-      advancedOpen = true;
     }
     if (source !== "capture") {
       addLog(
@@ -516,9 +561,10 @@
         ...headers,
         extra,
         subtitles,
+        subtitle,
       });
       pendingAfterReferer = "play";
-      if (!applyResolve(res)) return;
+      if (!applyPlayResult(res)) return;
       playing = true;
       if (extra) extraCount += 1;
       else extraCount = Math.max(1, extraCount);
@@ -844,8 +890,8 @@
       {/if}
 
       {#if variants.length > 0}
-        <div class="mt-3 flex flex-wrap gap-1.5">
-          {#each variants as v, i (v.quality + String(v.bandwidth))}
+        <div class="mt-3 flex flex-wrap items-center gap-1.5">
+          {#each variants as v (v.quality + String(v.bandwidth))}
             <button
               type="button"
               class="rounded-full border px-3 py-1 text-xs font-medium {quality ===
@@ -857,37 +903,70 @@
                 addLog("debug", `quality ${v.label}`);
               }}
             >
-              {v.label}{#if i === 0}
-                <span class="text-surface-500"> default</span>
-              {/if}
+              {v.label}
             </button>
           {/each}
+          {#if subTracks.length > 0}
+            <label class="ml-1 flex items-center gap-1.5 text-xs text-surface-400">
+              <span>Subtitles</span>
+              <select
+                class="rounded-lg border border-surface-600 bg-surface-850 px-2 py-1 text-xs text-surface-100 outline-none focus:border-accent-500"
+                bind:value={subtitle}
+                onchange={() => {
+                  const found = subtitleOptions.find((o) => o.id === subtitle);
+                  addLog("debug", `subtitle ${found?.label || subtitle}`);
+                }}
+              >
+                {#each subtitleOptions as o (o.id)}
+                  <option value={o.id}>{o.label}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
+        </div>
+      {:else if subTracks.length > 0}
+        <div class="mt-3 flex flex-wrap items-center gap-1.5">
+          <label class="flex items-center gap-1.5 text-xs text-surface-400">
+            <span>Subtitles</span>
+            <select
+              class="rounded-lg border border-surface-600 bg-surface-850 px-2 py-1 text-xs text-surface-100 outline-none focus:border-accent-500"
+              bind:value={subtitle}
+              onchange={() => {
+                const found = subtitleOptions.find((o) => o.id === subtitle);
+                addLog("debug", `subtitle ${found?.label || subtitle}`);
+              }}
+            >
+              {#each subtitleOptions as o (o.id)}
+                <option value={o.id}>{o.label}</option>
+              {/each}
+            </select>
+          </label>
         </div>
       {/if}
-
-      <label
-        for="referer-url"
-        class="mt-4 block text-xs font-medium uppercase tracking-wide text-surface-500"
-        >Referer</label
-      >
-      <input
-        id="referer-url"
-        class="mt-1 w-full rounded-lg border border-surface-700 bg-surface-850 px-3 py-1.5 font-mono text-xs outline-none ring-accent-500 focus:ring-2"
-        type="text"
-        spellcheck="false"
-        placeholder="player iframe URL from the m3u8 request, not the outer page"
-        bind:value={referer}
-        oninput={() => {
-          window.clearTimeout(resolveTimer);
-          resolveTimer = window.setTimeout(() => void autoResolve(), 450);
-        }}
-      />
 
       <details class="mt-3" bind:open={advancedOpen}>
         <summary
           class="cursor-pointer select-none text-xs text-surface-500 hover:text-surface-300"
-          >Origin and User-Agent</summary
+          >Referer, Origin and User-Agent</summary
         >
+        <div class="mt-2">
+          <label
+            for="referer-url"
+            class="text-xs uppercase tracking-wide text-surface-500">Referer</label
+          >
+          <input
+            id="referer-url"
+            class="mt-1 w-full rounded-lg border border-surface-700 bg-surface-850 px-3 py-1.5 font-mono text-xs outline-none ring-accent-500 focus:ring-2"
+            type="text"
+            spellcheck="false"
+            placeholder="player iframe URL from the m3u8 request, not the outer page"
+            bind:value={referer}
+            oninput={() => {
+              window.clearTimeout(resolveTimer);
+              resolveTimer = window.setTimeout(() => void autoResolve(), 450);
+            }}
+          />
+        </div>
         <div class="mt-2 grid gap-2 sm:grid-cols-2">
           <div>
             <label
@@ -917,6 +996,48 @@
             />
           </div>
         </div>
+        <div class="mt-2 rounded-lg border border-surface-700">
+          <div class="flex items-center justify-between px-3 py-1.5">
+            <span class="text-xs uppercase tracking-wide text-surface-500">Saved hosts</span>
+            <span class="text-xs font-normal text-surface-500">
+              {#if hosts.length > 0}{hosts.length}{/if}
+              .play.json
+            </span>
+          </div>
+          <div class="max-h-36 overflow-auto border-t border-surface-700">
+            {#if hosts.length === 0}
+              <p class="px-3 py-3 text-center text-xs text-surface-500">
+                Referers you save after a 403 land here.
+              </p>
+            {:else}
+              <table class="w-full text-left text-sm">
+                <tbody>
+                  {#each hosts as row (row.host)}
+                    <tr class="border-t border-surface-700 hover:bg-surface-800">
+                      <td class="px-3 py-1.5 font-mono text-xs">{row.host}</td>
+                      <td
+                        class="max-w-xs truncate px-3 py-1.5 font-mono text-xs text-surface-300"
+                        >{row.referer}</td
+                      >
+                      <td class="px-3 py-1.5 text-right">
+                        <button
+                          type="button"
+                          class="text-xs text-accent-400 hover:underline"
+                          onclick={() => useHost(row)}>Use</button
+                        >
+                        <button
+                          type="button"
+                          class="ml-3 text-xs text-danger-400 hover:underline"
+                          onclick={() => removeHost(row.host)}>Delete</button
+                        >
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/if}
+          </div>
+        </div>
       </details>
 
     </section>
@@ -930,52 +1051,6 @@
       onCopy={() => void copyLogs()}
     />
 
-    <details
-      class="rounded-xl border border-surface-800 bg-surface-900 open:max-h-48"
-    >
-      <summary
-        class="flex cursor-pointer list-none items-center justify-between px-4 py-2 text-sm font-semibold marker:content-none [&::-webkit-details-marker]:hidden"
-      >
-        <span>Saved hosts</span>
-        <span class="text-xs font-normal text-surface-500">
-          {#if hosts.length > 0}{hosts.length}{/if}
-          .play.json
-        </span>
-      </summary>
-      <div class="max-h-36 overflow-auto border-t border-surface-800">
-        {#if hosts.length === 0}
-          <p class="px-4 py-4 text-center text-xs text-surface-500">
-            Referers you save after a 403 land here.
-          </p>
-        {:else}
-          <table class="w-full text-left text-sm">
-            <tbody>
-              {#each hosts as row (row.host)}
-                <tr class="border-t border-surface-800 hover:bg-surface-850">
-                  <td class="px-4 py-1.5 font-mono text-xs">{row.host}</td>
-                  <td
-                    class="max-w-xs truncate px-4 py-1.5 font-mono text-xs text-surface-300"
-                    >{row.referer}</td
-                  >
-                  <td class="px-4 py-1.5 text-right">
-                    <button
-                      type="button"
-                      class="text-xs text-accent-400 hover:underline"
-                      onclick={() => useHost(row)}>Use</button
-                    >
-                    <button
-                      type="button"
-                      class="ml-3 text-xs text-danger-400 hover:underline"
-                      onclick={() => removeHost(row.host)}>Delete</button
-                    >
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        {/if}
-      </div>
-    </details>
     </div>
     <JobsPane
       {jobs}

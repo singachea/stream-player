@@ -49,10 +49,17 @@
     return `seg ${s.playhead}/${s.total}`;
   }
 
-  function bufferPct(s: StreamSession) {
-    if (!s.total) return 0;
-    const ahead = Math.min(s.buffered, s.total);
-    return Math.min(100, Math.round((ahead / s.total) * 100));
+  function windowSlots(s: StreamSession): boolean[] {
+    const w = s.window ?? [];
+    if (w.length >= 20) return w.slice(0, 20);
+    return [...w, ...Array(20 - w.length).fill(false)];
+  }
+
+  function slotTitle(s: StreamSession, i: number): string {
+    if (s.windowStart == null) return `piece ${i + 1} of 20 (0.5% each)`;
+    const lo = s.windowStart + Math.floor(((s.windowLen || 0) * i) / 20);
+    const hi = s.windowStart + Math.floor(((s.windowLen || 0) * (i + 1)) / 20) - 1;
+    return lo > hi ? `piece ${i + 1} of 20 (empty)` : `seg ${lo}–${hi}`;
   }
 </script>
 
@@ -130,11 +137,19 @@
                   Stop
                 </button>
               </div>
-              <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-surface-800">
-                <div
-                  class="h-full animate-pulse rounded-full bg-accent-500 transition-[width] duration-150"
-                  style="width: {bufferPct(s)}%"
-                ></div>
+              <div
+                class="mt-1.5 flex gap-0.5"
+                role="img"
+                aria-label={`Buffered ${s.buffered} segments after ${playheadLabel(s)}`}
+              >
+                {#each windowSlots(s) as filled, i}
+                  <div
+                    class="h-1.5 min-w-0 flex-1 rounded-sm {filled
+                      ? 'bg-accent-500'
+                      : 'bg-surface-800'}"
+                    title={slotTitle(s, i)}
+                  ></div>
+                {/each}
               </div>
               <p class="mt-1 text-[11px] text-accent-400">
                 {playheadLabel(s)} · +{s.buffered} buffered

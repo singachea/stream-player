@@ -8,9 +8,9 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::fetch::http_get;
 use crate::hls::{
-    is_subtitle_url, local_master_playlist, map_or_first_segment_url, playlist_hint,
-    resolve_media_playlist, rewrite_media_playlist, sniff_segment_kind, subtitle_content_type,
-    subtitle_ext, unwrap_media, SubtitleTrack,
+    filter_subtitles, is_subtitle_url, local_master_playlist, map_or_first_segment_url,
+    playlist_hint, resolve_media_playlist, rewrite_media_playlist, sniff_segment_kind,
+    subtitle_content_type, subtitle_ext, unwrap_media, SubtitleTrack,
 };
 use crate::proxy::{start_file_proxy, start_proxy, ProxyHandle};
 
@@ -211,6 +211,7 @@ pub fn start_hls_playback<F>(
     verbose: bool,
     interactive: bool,
     extra_subs: &[String],
+    subtitle: Option<&str>,
     mut on_403: Option<&mut F>,
     mut on_stage: Option<&mut PlayStage>,
     prefetch_count: usize,
@@ -232,6 +233,7 @@ where
     let media_text = resolved.media_text;
     let mut subs = resolved.subtitles;
     merge_extra_subs(&mut subs, extra_subs);
+    let subs = filter_subtitles(subs, subtitle);
     emit_stage_opt(&mut on_stage, "sniff", 1, 5, None);
     let first = map_or_first_segment_url(&media_url, &media_text);
     let ext = first

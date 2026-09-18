@@ -14,7 +14,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::download::{clamp_workers, download_stream, DEFAULT_WORKERS, MAX_WORKERS, MIN_WORKERS};
 use crate::error::Error;
 use crate::fetch::{http_get_maybe_playlist, http_headers, CancelCtx, MaybePlaylist};
-use crate::hls::{parse_variants, ranked_variants, variant_label, Variant};
+use crate::hls::{
+    parse_subtitle_tracks, parse_variants, ranked_variants, subtitle_label, variant_label, Variant,
+};
 use crate::player::{
     start_hls_playback, start_http_playback, vlc_path, vlc_stderr_level, wait_for_vlc,
 };
@@ -81,10 +83,15 @@ pub struct StreamDto {
     pub quality: String,
     pub status: String,
     pub pid: Option<u32>,
-    /// Highest segment index VLC has requested (playhead).
+    /// Last segment index VLC requested (playhead). Seeks move it.
     pub playhead: Option<usize>,
-    /// Segments cached ahead of the playhead.
+    /// Contiguous cached segments right after the playhead.
     pub buffered: usize,
+    /// Cached/uncached flags for the next 10% window after the playhead,
+    /// sampled into 20 pieces (each piece is 0.5% of the playlist).
+    pub window: Vec<bool>,
+    pub window_start: Option<usize>,
+    pub window_len: usize,
     pub total: usize,
     pub cached_bytes: u64,
     pub served: u64,
@@ -92,32 +99,48 @@ pub struct StreamDto {
 
 impl StreamSession {
     fn dto(&self) -> StreamDto {
-        let (playhead, buffered, total, cached_bytes, served) = match &self.proxy {
-            Some(p) => {
-                let st = p.state.lock().unwrap();
-                let total = st.segments.len();
-                let playhead = st.served_max;
-                // Contiguous cached run ahead of the playhead. Sparse
-                // entries past a gap do not count: VLC cannot play them yet.
-                let start = playhead.map_or(0, |h| h + 1);
-                let mut buffered = 0;
-                for n in start..total {
-                    if st.seg_cache.contains_key(&n) {
-                        buffered += 1;
-                    } else {
-                        break;
+        let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
+            match &self.proxy {
+                Some(p) => {
+                    let st = p.state.lock().unwrap();
+                    let total = st.segments.len();
+                    let playhead = st.served_cur;
+                    // Contiguous cached run ahead of the playhead. Sparse
+                    // entries past a gap do not count: VLC cannot play them yet.
+                    let start = playhead.map_or(0, |h| h + 1);
+                    let mut buffered = 0;
+                    for n in start..total {
+                        if st.seg_cache.contains_key(&n) {
+                            buffered += 1;
+                        } else {
+                            break;
+                        }
                     }
+                    // Next 10% window after the playhead, sampled into 20
+                    // pieces (0.5% each). A piece is filled when any segment
+                    // in its slice is cached. Gaps stay visible until the
+                    // fetcher fills them in order.
+                    let want = crate::proxy::readahead_window(total, start);
+                    let window_start = (want > 0).then_some(start);
+                    let mut window = Vec::new();
+                    for i in 0..20 {
+                        let lo = start + (want * i) / 20;
+                        let hi = start + (want * (i + 1)) / 20;
+                        window.push(lo < hi && (lo..hi).any(|n| st.seg_cache.contains_key(&n)));
+                    }
+                    (
+                        playhead,
+                        buffered,
+                        window,
+                        window_start,
+                        want,
+                        total,
+                        st.cached_bytes,
+                        st.served_count,
+                    )
                 }
-                (
-                    playhead,
-                    buffered,
-                    total,
-                    st.cached_bytes,
-                    st.served_count,
-                )
-            }
-            None => (None, 0, 0, 0, 0),
-        };
+                None => (None, 0, Vec::new(), None, 0, 0, 0, 0),
+            };
         StreamDto {
             id: self.id,
             url: self.url.clone(),
@@ -127,6 +150,9 @@ impl StreamSession {
             pid: self.pid,
             playhead,
             buffered,
+            window,
+            window_start,
+            window_len,
             total,
             cached_bytes,
             served,
@@ -362,12 +388,22 @@ pub struct VariantDto {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleDto {
+    pub label: String,
+    pub name: String,
+    pub language: String,
+    pub default: bool,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum ResolveResponse {
     Ok {
         kind: String,
         host: String,
         variants: Vec<VariantDto>,
+        subtitles: Vec<SubtitleDto>,
         referer: String,
         origin: String,
     },
@@ -376,6 +412,18 @@ pub enum ResolveResponse {
         hint: String,
         host: String,
     },
+}
+
+fn subtitles_dto(tracks: &[crate::hls::SubtitleTrack]) -> Vec<SubtitleDto> {
+    tracks
+        .iter()
+        .map(|t| SubtitleDto {
+            label: subtitle_label(t),
+            name: t.name.clone(),
+            language: t.language.clone(),
+            default: t.default,
+        })
+        .collect()
 }
 
 fn variants_dto(v: &[Variant]) -> Vec<VariantDto> {
@@ -590,6 +638,7 @@ fn resolve_blocking(
             kind: kind.as_str().into(),
             host,
             variants: vec![],
+            subtitles: vec![],
             referer: referer_s,
             origin: origin_s,
         });
@@ -608,6 +657,7 @@ fn resolve_blocking(
                 kind: "http".into(),
                 host,
                 variants: vec![],
+                subtitles: vec![],
                 referer: referer_s,
                 origin: origin_s,
             })
@@ -634,10 +684,16 @@ fn resolve_blocking(
             };
             let labels: Vec<_> = variants.iter().map(|v| v.label.as_str()).collect();
             log(app, "info", format!("qualities: {}", labels.join(", ")));
+            let subtitles = parse_subtitle_tracks(&text, &final_url);
+            if !subtitles.is_empty() {
+                let names: Vec<_> = subtitles.iter().map(|t| subtitle_label(t)).collect();
+                log(app, "info", format!("subtitles: {}", names.join(", ")));
+            }
             Ok(ResolveResponse::Ok {
                 kind: "hls".into(),
                 host,
                 variants,
+                subtitles: subtitles_dto(&subtitles),
                 referer: headers.get("Referer").cloned().unwrap_or(referer_s),
                 origin: headers.get("Origin").cloned().unwrap_or(origin_s),
             })
@@ -662,6 +718,7 @@ pub async fn play_cmd(
     cookie_host: Option<String>,
     extra: Option<bool>,
     subtitles: Option<Vec<String>>,
+    subtitle: Option<String>,
     prefetch_count: Option<usize>,
 ) -> Result<ResolveResponse, String> {
     let app2 = app.clone();
@@ -679,6 +736,7 @@ pub async fn play_cmd(
             cookie_host,
             extra,
             subtitles,
+            subtitle,
             prefetch_count,
         )
     })
@@ -762,6 +820,7 @@ fn play_blocking(
     cookie_host: Option<String>,
     extra: Option<bool>,
     subtitles: Option<Vec<String>>,
+    subtitle: Option<String>,
     prefetch_count: Option<usize>,
 ) -> Result<ResolveResponse, String> {
     let extra = extra.unwrap_or(false);
@@ -833,6 +892,7 @@ fn play_blocking(
                 kind: kind.as_str().into(),
                 host: host_of(url),
                 variants: vec![],
+                subtitles: vec![],
                 referer,
                 origin,
             })
@@ -852,6 +912,7 @@ fn play_blocking(
                 false,
                 false,
                 &extra_subs,
+                subtitle.as_deref(),
                 None,
                 Some(&mut on_stage),
                 prefetch_count,
@@ -870,6 +931,7 @@ fn play_blocking(
                         kind: "hls".into(),
                         host: host_of(url),
                         variants: vec![],
+                        subtitles: vec![],
                         referer,
                         origin,
                     })
@@ -902,6 +964,7 @@ fn play_blocking(
                         kind: "http".into(),
                         host: host_of(url),
                         variants: vec![],
+                        subtitles: vec![],
                         referer,
                         origin,
                     })

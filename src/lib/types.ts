@@ -15,6 +15,13 @@ export interface Variant {
   bandwidth: number;
 }
 
+export interface Subtitle {
+  label: string;
+  name: string;
+  language: string;
+  default: boolean;
+}
+
 export interface HostRow {
   host: string;
   referer: string;
@@ -26,6 +33,7 @@ export type ResolveOk = {
   kind: string;
   host: string;
   variants: Variant[];
+  subtitles: Subtitle[];
   referer: string;
   origin: string;
 };
