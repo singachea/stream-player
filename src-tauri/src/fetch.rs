@@ -617,6 +617,28 @@ fn http_error_hint(code: u16, url: &str, body: &[u8], headers: &HashMap<String, 
     if code == 403 {
         return http_403_hint_for(url, body, headers.get("Referer").map(|s| s.as_str()));
     }
+    if code == 404 {
+        return " (playlist or segment expired — capture a fresh URL from the player)".into();
+    }
+    if code == 410 {
+        return " (stream expired — capture a fresh URL from the player)".into();
+    }
+    if code == 429 {
+        return " (rate limited — wait a minute and retry)".into();
+    }
+    if (500..600).contains(&code) {
+        let text = String::from_utf8_lossy(&body[..body.len().min(160)]).trim().to_string();
+        let preview = if text.is_empty() {
+            String::new()
+        } else {
+            format!(": {text:?}")
+        };
+        return format!(
+            " (media origin error HTTP {code}{preview} — the playlist is fine but the \
+segment host is down or rejecting this network. Retry later, or Copy as cURL \
+from a 200 segment request in DevTools)"
+        );
+    }
     if code == 401 {
         return " (server requires auth — Copy as cURL from a 200 request in the browser, including Cookie)"
             .into();
@@ -817,6 +839,20 @@ Terms of Service violations.The affected zone is cdn.example.",
             "https://cdn.example/a.m3u8?t=x&s=1&e=2",
             b""
         ));
+    }
+
+    #[test]
+    fn test_server_error_hint_names_origin() {
+        let hint = http_error_hint(
+            522,
+            "https://cdn.example/seg0",
+            b"error code: 522\n",
+            &HashMap::new(),
+        );
+        assert!(hint.contains("media origin error HTTP 522"));
+        assert!(hint.contains("Copy as cURL"));
+        let hint = http_error_hint(404, "https://cdn.example/a.m3u8", b"", &HashMap::new());
+        assert!(hint.contains("fresh URL"));
     }
 
     #[test]

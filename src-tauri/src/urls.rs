@@ -140,43 +140,46 @@ pub fn auto_filename(url: &str) -> String {
     format!("{stem}{ext}")
 }
 
-/// Some CDNs (okcdn `vd*.okcdn.ru`) encode the byte range in a `bytes=START-END`
-/// query param instead of a `Range` header. A captured URL like `...&bytes=0-47101`
-/// is only that 47KB slice: VLC gets a truncated file and reports
-/// `mkv demux error: cannot find any cluster or chapter`. Drop the param so
-/// playback and download fetch the whole file; VLC seeks with Range headers.
+/// Some CDNs encode a byte range in the query instead of a `Range` header:
+/// okcdn uses `bytes=START-END`, Instagram/Facebook `bytestart`/`byteend`.
+/// A captured URL like `...&bytestart=818&byteend=909` is only that slice:
+/// VLC gets a truncated file and reports `avcodec demux error` / `cannot seek`.
+/// Drop those params so playback and download fetch the whole file; VLC seeks
+/// with Range headers. Remaining query pairs are kept byte-for-byte so CDN
+/// signatures (`oh`, `efg`, …) are not re-encoded.
 pub fn strip_range_query(url: &str) -> String {
-    let Ok(mut u) = Url::parse(strip_proto(url)) else {
+    let Some((base, rest)) = strip_proto(url).split_once('?') else {
         return url.to_string();
     };
-    let kept: Vec<(String, String)> = u
-        .query_pairs()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("bytes"))
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+    let (query, frag) = match rest.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (rest, None),
+    };
+    let pairs: Vec<&str> = query.split('&').collect();
+    let kept: Vec<&str> = pairs
+        .iter()
+        .copied()
+        .filter(|pair| !is_byte_range_query_key(pair.split('=').next().unwrap_or("")))
         .collect();
-    if kept.len() == u.query_pairs().count() {
+    if kept.len() == pairs.len() {
         return url.to_string();
     }
-    u.query_pairs_mut().clear();
-    for (k, v) in &kept {
-        u.query_pairs_mut().append_pair(k, v);
-    }
-    u.to_string()
-}
-
-fn pct_encode(s: &str, allow_slash: bool, allow_eq: bool) -> String {
-    let mut out = String::new();
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            b'/' if allow_slash => out.push('/'),
-            b'=' if allow_eq => out.push('='),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
+    let mut out = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    if let Some(f) = frag {
+        out.push('#');
+        out.push_str(f);
     }
     out
+}
+
+fn is_byte_range_query_key(k: &str) -> bool {
+    k.eq_ignore_ascii_case("bytes")
+        || k.eq_ignore_ascii_case("bytestart")
+        || k.eq_ignore_ascii_case("byteend")
 }
 
 /// nginx WAF 400s on `_` in the query when the path contains `=`.
@@ -191,8 +194,10 @@ fn raw_request_target(u: &Url) -> String {
     }
 }
 
-/// Origin URL plus a request-target with WAF-safe percent-encoding
-/// (`=` in the path, `_` in query values). Pass to curl as
+/// Origin URL plus a request-target with WAF-safe query encoding
+/// (`_` → `%5F` when the path contains `=`). The path is left as parsed:
+/// nginx-vod urlset paths use commas, and encoding them as `%2C` makes
+/// signed `.ts` hashes fail with HTTP 471. Pass to curl as
 /// `--request-target TARGET` plus the **full** URL (not `ORIGIN/`) so
 /// `%{url_effective}` keeps the playlist path for relative segment joins.
 pub fn curl_connect_and_target(raw: &str) -> (String, String) {
@@ -200,7 +205,7 @@ pub fn curl_connect_and_target(raw: &str) -> (String, String) {
         return (raw.to_string(), String::new());
     };
     let connect = format!("{}://{}/", u.scheme(), u.authority());
-    let path = pct_encode(u.path(), true, true);
+    let path = u.path().to_string();
     let target = match u.query() {
         Some(q) => {
             let q = if u.path().contains('=') {
@@ -568,9 +573,8 @@ mod tests {
 
     #[test]
     fn test_curl_connect_and_target_encodes_query_underscore() {
-        let (base, target) = curl_connect_and_target(
-            "https://cdn.example/clip=.mp4?md5=token_id&expires=1",
-        );
+        let (base, target) =
+            curl_connect_and_target("https://cdn.example/clip=.mp4?md5=token_id&expires=1");
         assert_eq!(base, "https://cdn.example/");
         assert!(target.starts_with("/clip=.mp4?"));
         assert!(target.contains("md5=token%5Fid"));
@@ -591,6 +595,32 @@ mod tests {
         );
         assert!(target.contains("abc_def"), "do not WAF-encode HLS tokens");
         assert!(!target.contains("%5F"));
+    }
+
+    #[test]
+    fn test_curl_url_args_keeps_urlset_commas() {
+        // nginx-vod urlset paths use commas. Percent-encoding them in
+        // --request-target makes the signed hash fail on .ts (HTTP 471).
+        let url = "https://cdn.example/_hls/v/id-,426-240-312,640-360,-h264.mp4.urlset/seg-1-f4-v1-a1.ts?validfrom=1&hash=A%2F00j5C5e4SWvoWyhESwGXVEB6k%3D";
+        let args = curl_url_args(url);
+        assert_eq!(
+            args,
+            vec![url],
+            "comma paths must not force --request-target, got {args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("%2C")));
+        let joined = join_url(
+            "https://cdn.example/_hls/v/id-,426-240-312,640-360,-h264.mp4.urlset/index-f4-v1-a1.m3u8?validfrom=1&hash=A%2F00j5C5e4SWvoWyhESwGXVEB6k%3D",
+            "seg-1-f4-v1-a1.ts?validfrom=1&hash=A%2F00j5C5e4SWvoWyhESwGXVEB6k%3D",
+        );
+        assert!(
+            joined.contains("hash=A%2F00j5C5e4SWvoWyhESwGXVEB6k%3D"),
+            "signed query encoding must stay: {joined}"
+        );
+        assert!(
+            joined.contains("426-240-312"),
+            "urlset commas must stay: {joined}"
+        );
     }
 
     #[test]
@@ -638,7 +668,10 @@ mod tests {
   -H 'cookie: a=1; b=2'"#;
         let p = parse_curl(cmd).unwrap();
         assert_eq!(p.url, "https://cdn.example/hls/show/id/master.m3u8");
-        assert_eq!(p.referer.as_deref(), Some("https://player.example/watch/abc"));
+        assert_eq!(
+            p.referer.as_deref(),
+            Some("https://player.example/watch/abc")
+        );
         assert_eq!(p.origin.as_deref(), Some("https://player.example"));
         assert_eq!(p.user_agent.as_deref(), Some("Mozilla/5.0 Test"));
         assert_eq!(p.cookie.as_deref(), Some("a=1; b=2"));
@@ -662,10 +695,7 @@ mod tests {
             "play://open?url=https%3A%2F%2Fcdn.example%2Fhls%2Findex_720p.m3u8%3Ftoken%3Dab_cd&referer=https%3A%2F%2Fembed.example%2Fwatch%2F1",
         )
         .unwrap();
-        assert_eq!(
-            p.url,
-            "https://cdn.example/hls/index_720p.m3u8?token=ab_cd"
-        );
+        assert_eq!(p.url, "https://cdn.example/hls/index_720p.m3u8?token=ab_cd");
         assert_eq!(p.referer.as_deref(), Some("https://embed.example/watch/1"));
     }
 
@@ -779,6 +809,21 @@ mod tests {
             strip_range_query("https://cdn.example/hls/master.m3u8?token=abc"),
             "https://cdn.example/hls/master.m3u8?token=abc"
         );
+    }
+
+    #[test]
+    fn test_strip_range_query_removes_instagram_bytestart() {
+        let url = "https://scontent.example/o1/v/clip.mp4?_nc_cat=106&efg=eyJ2%3D%3D&oh=00_AQ&oe=6AAE&bytestart=818&byteend=909";
+        let full = strip_range_query(url);
+        assert!(!full.contains("bytestart"), "range start must go: {full}");
+        assert!(!full.contains("byteend"), "range end must go: {full}");
+        assert!(full.contains("_nc_cat=106"));
+        assert!(
+            full.contains("efg=eyJ2%3D%3D"),
+            "signed param encoding must stay: {full}"
+        );
+        assert!(full.contains("oh=00_AQ"));
+        assert!(full.contains("oe=6AAE"));
     }
 
     #[test]

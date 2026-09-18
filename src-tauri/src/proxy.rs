@@ -335,6 +335,30 @@ fn proxy_log(state: &Mutex<ProxyState>, level: &str, msg: String) {
     }
 }
 
+/// Refetch a failed segment once for a one-line diagnosis: HTTP status or
+/// transport error plus a short body preview.
+fn segment_fetch_detail(src: &str, headers: &mut HashMap<String, String>) -> (u16, String) {
+    match crate::fetch::http_get_timeout(src, headers, 20) {
+        Ok((_, body)) => {
+            let preview: String = String::from_utf8_lossy(&body[..body.len().min(80)])
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                .take(80)
+                .collect();
+            (200, format!(" (HTTP 200, {} bytes, rejected: {preview:?})", body.len()))
+        }
+        Err(crate::error::Error::Http { code, hint, body, .. }) => {
+            let preview: String = String::from_utf8_lossy(&body[..body.len().min(80)])
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                .take(80)
+                .collect();
+            (code, format!(" (HTTP {code}{hint}: {preview:?})"))
+        }
+        Err(e) => (0, format!(" ({e})")),
+    }
+}
+
 fn file_content_type(path: &str) -> &'static [u8] {
     if path.ends_with(".m3u8") {
         b"application/vnd.apple.mpegurl"
@@ -497,7 +521,12 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
                 trigger_readahead(state.clone(), stop.clone());
             }
             None => {
-                proxy_log(state, "error", format!("seg {idx} {src} → upstream failed"));
+                let (_, detail) = segment_fetch_detail(&src, &mut hdrs);
+                proxy_log(
+                    state,
+                    "error",
+                    format!("seg {idx} {src} → upstream failed{detail}"),
+                );
                 let _ =
                     request.respond(Response::from_string("upstream failed").with_status_code(502));
             }
