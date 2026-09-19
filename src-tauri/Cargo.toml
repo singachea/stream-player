@@ -1,6 +1,6 @@
 [package]
 name = "stream-player"
-version = "0.1.0"
+version = "0.2.0"
 description = "Play HLS/HTTP streams in VLC with seeking"
 authors = ["you"]
 edition = "2021"
