@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -129,6 +130,9 @@ pub struct Playback {
     pub child: Child,
     pub hint: String,
     pub play_url: String,
+    /// Staged subtitle files handed to VLC by local path. The caller moves
+    /// these into the stream session; `stop()` removes any left behind.
+    pub staged_subs: Vec<std::path::PathBuf>,
 }
 
 fn vlc_sub_options(sidecar: &[String], enable_embedded: bool) -> Vec<String> {
@@ -145,17 +149,44 @@ fn vlc_sub_options(sidecar: &[String], enable_embedded: bool) -> Vec<String> {
     o
 }
 
+/// VLC resolves `--sub-file` against the working directory: a plain
+/// `http://...` value is parsed as a file path, which produces errors like
+/// `file:///.../http%3A//127.0.0.1%3A.../sub/0.vtt`. Stage the fetched body
+/// to a temp file instead and hand VLC the local path.
+fn stage_sub(body: &[u8], ext: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!(
+        "play-subs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(format!("sub.{}", ext.trim_start_matches('.')));
+    if fs::write(&path, body).is_err() {
+        let _ = fs::remove_dir_all(&dir);
+        return None;
+    }
+    Some(path)
+}
+
 fn merge_extra_subs(tracks: &mut Vec<SubtitleTrack>, extra: &[String]) {
     for u in extra {
         let u = u.trim();
         if u.is_empty() || tracks.iter().any(|t| t.url == u) {
             continue;
         }
+        // Keep the raw file name (e.g. "English.vtt") so the in-app picker
+        // can rank sidecars by name even when no LANGUAGE tag exists.
         let name = url::Url::parse(u)
             .ok()
             .and_then(|p| {
                 p.path_segments()
                     .and_then(|s| s.last())
+                    // path_segments yields percent-decoded segments already.
                     .map(|s| s.to_string())
             })
             .filter(|s| !s.is_empty())
@@ -173,6 +204,24 @@ impl Playback {
     pub fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        Self::remove_staged(&mut self.staged_subs);
+    }
+
+    fn remove_staged(staged: &mut Vec<std::path::PathBuf>) {
+        for path in std::mem::take(staged) {
+            let dir = path.parent().map(Path::to_path_buf);
+            let _ = fs::remove_file(&path);
+            if let Some(dir) = dir {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+    }
+
+    /// Take staged subtitle paths for the session to own. Called when
+    /// ownership moves into a stream session (commands.rs removes them
+    /// when the session ends); `stop()` removes any left behind.
+    pub fn take_staged_subs(&mut self) -> Vec<std::path::PathBuf> {
+        std::mem::take(&mut self.staged_subs)
     }
 }
 
@@ -252,6 +301,7 @@ where
     let mut files = HashMap::new();
     let mut hls_subs: Vec<(SubtitleTrack, String)> = Vec::new();
     let mut sidecar: Vec<String> = Vec::new();
+    let mut staged: Vec<std::path::PathBuf> = Vec::new();
     let total_subs = subs.len().max(1);
     for (i, track) in subs.iter().enumerate() {
         emit_stage_opt(&mut on_stage, "subtitles", i, total_subs, Some(track.name.clone()));
@@ -270,8 +320,17 @@ where
             hls_subs.push((track.clone(), format!("{}{path}", proxy.base)));
         } else if subtitle_content_type(&body).is_some() || is_subtitle_url(&track.url) {
             let path = format!("/sub/{i}.{}", subtitle_ext(&track.url));
-            files.insert(path.clone(), body);
-            sidecar.push(format!("{}{path}", proxy.base));
+            files.insert(path.clone(), body.clone());
+            // Hand VLC a staged local file, not the proxy URL. VLC parses
+            // `--sub-file=http://...` as a relative file path and fails with
+            // `file:///.../http%3A//...`, so the fetched body is staged here.
+            match stage_sub(&body, subtitle_ext(&track.url)) {
+                Some(staged_path) => {
+                    sidecar.push(staged_path.to_string_lossy().into_owned());
+                    staged.push(staged_path);
+                }
+                None => sidecar.push(format!("{}{path}", proxy.base)),
+            }
         }
     }
     let video_url = proxy.playlist_url();
@@ -301,6 +360,9 @@ where
     }
     let mut args = vlc_sub_options(&sidecar, embedded);
     args.push(play_url.clone());
+    if verbose {
+        eprintln!("play: vlc sub args {}", sidecar.join(", "));
+    }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     if prefetch_count > 0 {
         let total = prefetch_count.min(proxy.state.lock().unwrap().segments.len());
@@ -323,6 +385,7 @@ where
         child,
         hint,
         play_url,
+        staged_subs: staged,
     })
 }
 
@@ -410,6 +473,7 @@ pub fn start_http_playback(
     let proxy = start_file_proxy(full, headers.clone(), verbose)?;
     let local = proxy.file_url();
     let mut sidecar = Vec::new();
+    let mut staged: Vec<std::path::PathBuf> = Vec::new();
     if !extra_subs.is_empty() {
         let mut files = HashMap::new();
         let mut hdrs = headers.clone();
@@ -423,8 +487,14 @@ pub fn start_http_playback(
                 continue;
             }
             let path = format!("/sub/{i}.{}", subtitle_ext(u));
-            files.insert(path.clone(), body);
-            sidecar.push(format!("{}{path}", proxy.base));
+            files.insert(path.clone(), body.clone());
+            match stage_sub(&body, subtitle_ext(u)) {
+                Some(staged_path) => {
+                    sidecar.push(staged_path.to_string_lossy().into_owned());
+                    staged.push(staged_path);
+                }
+                None => sidecar.push(format!("{}{path}", proxy.base)),
+            }
         }
         proxy.state.lock().unwrap().files = files;
     }
@@ -433,6 +503,9 @@ pub fn start_http_playback(
     }
     let mut args = vlc_sub_options(&sidecar, false);
     args.push(local.clone());
+    if verbose {
+        eprintln!("play: vlc sub args {}", sidecar.join(", "));
+    }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     emit_stage_opt(&mut on_stage, "launch", 1, 2, None);
     let child = spawn_vlc(vlc, &arg_refs)?;
@@ -446,6 +519,7 @@ pub fn start_http_playback(
             format!("http subs={}", sidecar.len())
         },
         play_url: local,
+        staged_subs: staged,
     })
 }
 

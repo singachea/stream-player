@@ -97,16 +97,25 @@ pub fn subtitle_label(t: &SubtitleTrack) -> String {
     }
 }
 
-fn subtitle_rank(t: &SubtitleTrack) -> (u8, u8) {
+fn subtitle_rank(t: &SubtitleTrack) -> (u8, u8, bool) {
     let lang = t.language.to_ascii_lowercase();
     let name = t.name.to_ascii_lowercase();
+    // Sidecars from the extension have no LANGUAGE tag; match the file stem
+    // ("English.vtt", "en.srt") the same way so English still wins.
+    let stem = name
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(&name)
+        .replace(['-', '_', '.', '+', '%'], " ");
     let english = lang == "en"
         || lang.starts_with("en-")
         || lang.starts_with("eng")
-        || name == "english"
-        || name.starts_with("english ");
+        || stem == "english"
+        || stem.starts_with("english ")
+        || stem.split_whitespace().any(|w| w == "english")
+        || stem.split_whitespace().any(|w| w == "en" || w == "eng");
     let flagged = u8::from(!t.default);
-    (flagged, u8::from(!english))
+    (flagged, u8::from(!english), english)
 }
 
 /// Id of the picked subtitle, or None for off. Empty/off picks None; "auto"
@@ -792,6 +801,25 @@ index.m3u8
         let one = filter_subtitles(tracks, None);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].language, "es");
+    }
+
+    #[test]
+    fn test_pick_subtitle_prefers_english_sidecar_stem() {
+        let tracks = vec![
+            SubtitleTrack {
+                name: "Spanish.srt".into(),
+                language: String::new(),
+                url: "https://cdn.example/Spanish.srt".into(),
+                default: false,
+            },
+            SubtitleTrack {
+                name: "English.vtt".into(),
+                language: String::new(),
+                url: "https://cdn.example/English.vtt".into(),
+                default: false,
+            },
+        ];
+        assert_eq!(pick_subtitle(&tracks, None), Some(1));
     }
 
     #[test]

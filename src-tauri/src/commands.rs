@@ -72,6 +72,9 @@ pub struct StreamSession {
     pid: Option<u32>,
     status: String,
     proxy: Option<ProxyHandle>,
+    /// Staged subtitle files VLC reads by local path. Dropped when the
+    /// session ends so temp dirs are cleaned up after VLC exits.
+    staged_subs: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Serialize)]
@@ -887,7 +890,18 @@ fn play_blocking(
             if !pb.hint.is_empty() {
                 log_vlc(app, "debug", pid, pb.hint.clone());
             }
-            spawn_session(app, state, pb.child, Some(pb.proxy), extra, url, q);
+            let mut pb = pb;
+            let staged = pb.take_staged_subs();
+            spawn_session(
+                app,
+                state,
+                pb.child,
+                Some(pb.proxy),
+                extra,
+                url,
+                q,
+                staged,
+            );
             Ok(ResolveResponse::Ok {
                 kind: kind.as_str().into(),
                 host: host_of(url),
@@ -926,7 +940,18 @@ fn play_blocking(
                     if !pb.hint.is_empty() {
                         log_vlc(app, "debug", pid, pb.hint.clone());
                     }
-                    spawn_session(app, state, pb.child, Some(pb.proxy), extra, url, q);
+                    let mut pb = pb;
+                    let staged = pb.take_staged_subs();
+                    spawn_session(
+                        app,
+                        state,
+                        pb.child,
+                        Some(pb.proxy),
+                        extra,
+                        url,
+                        q,
+                        staged,
+                    );
                     Ok(ResolveResponse::Ok {
                         kind: "hls".into(),
                         host: host_of(url),
@@ -959,7 +984,18 @@ fn play_blocking(
                     let local = pb.play_url.clone();
                     let pid = pb.child.id();
                     log_vlc(app, "debug", pid, format!("local file {local}"));
-                    spawn_session(app, state, pb.child, Some(pb.proxy), extra, url, q);
+                    let mut pb = pb;
+                    let staged = pb.take_staged_subs();
+                    spawn_session(
+                        app,
+                        state,
+                        pb.child,
+                        Some(pb.proxy),
+                        extra,
+                        url,
+                        q,
+                        staged,
+                    );
                     Ok(ResolveResponse::Ok {
                         kind: "http".into(),
                         host: host_of(url),
@@ -978,6 +1014,16 @@ fn play_blocking(
     }
 }
 
+fn remove_staged_subs(paths: Vec<std::path::PathBuf>) {
+    for path in paths {
+        let dir = path.parent().map(std::path::Path::to_path_buf);
+        let _ = std::fs::remove_file(&path);
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 fn spawn_session(
     app: &AppHandle,
     state: &AppState,
@@ -986,6 +1032,7 @@ fn spawn_session(
     extra: bool,
     url: &str,
     quality: &str,
+    staged_subs: Vec<std::path::PathBuf>,
 ) {
     let pid = child.id();
     if extra {
@@ -1009,6 +1056,7 @@ fn spawn_session(
             pid: Some(pid),
             status: "playing".into(),
             proxy,
+            staged_subs,
         },
     );
     if let Some(dto) = patch_stream(app, stream_id, |_| {}) {
@@ -1063,7 +1111,10 @@ fn spawn_session(
         }
         st.extras.lock().unwrap().retain(|p| *p != pid);
         let removed = st.streams.lock().unwrap().remove(&stream_id);
-        if removed.is_some() {
+        if let Some(s) = removed {
+            // Temp subtitle dirs die with the session so VLC can read them
+            // for the whole playback and nothing lingers after.
+            remove_staged_subs(s.staged_subs);
             let _ = app.emit("stream-removed", stream_id);
         }
         log_vlc(&app, "debug", pid, format!("VLC pid={pid} exited {code}"));
@@ -1116,6 +1167,7 @@ pub fn stop_stream_cmd(app: AppHandle, id: u64) -> Result<(), String> {
     if let Some(pid) = s.pid {
         st.extras.lock().unwrap().retain(|p| *p != pid);
     }
+    remove_staged_subs(s.staged_subs);
     let _ = app.emit("stream-removed", id);
     Ok(())
 }

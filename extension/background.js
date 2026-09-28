@@ -293,7 +293,9 @@ async function remember(tabId, url, extra, frameId) {
       .forEach((k) => delete map[k]);
   }
   await saveTab(tabId, map);
-  await setBadge(tabId, Object.keys(map).length);
+  // Badge counts playable streams, not subtitle sidecars bundled under them.
+  const streams = Object.values(map).filter((v) => !isSubUrl(v?.url || "")).length;
+  await setBadge(tabId, streams);
   chrome.runtime
     .sendMessage({ cmd: "playlist-detected", tabId, value: next })
     .catch(() => {});

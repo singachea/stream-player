@@ -454,14 +454,29 @@ fn capture_from_pairs<'a>(
     let mut url = None;
     let mut referer = None;
     let mut origin = None;
+    let mut subtitles = Vec::new();
     for (k, v) in pairs {
         match k.as_ref() {
             "url" => url = http_https(&v),
             "referer" | "initiator" => referer = http_https(&v),
             "origin" => origin = http_https(&v),
+            // Repeated `sub=` params from the extension play:// fallback.
+            // Each value is validated as http(s) before bundling.
+            "sub" | "subtitle" | "subtitles" => {
+                if let Some(s) = http_https(&v) {
+                    if !subtitles.contains(&s) {
+                        subtitles.push(s);
+                    }
+                }
+            }
             _ => {}
         }
     }
+    let subtitles = if subtitles.is_empty() {
+        None
+    } else {
+        Some(subtitles)
+    };
     Some(ParsedCurl {
         url: url?,
         referer,
@@ -469,11 +484,11 @@ fn capture_from_pairs<'a>(
         user_agent: None,
         cookie: None,
         cookie_host: None,
-        subtitles: None,
+        subtitles,
     })
 }
 
-/// `play://open?url=...&referer=...&origin=...` from the extension fallback.
+/// `play://open?url=...&referer=...&origin=...&sub=...` from the extension fallback.
 pub fn parse_capture_url(raw: &str) -> Option<ParsedCurl> {
     let parsed = Url::parse(raw.trim()).ok()?;
     if parsed.scheme() != "play" {
@@ -697,6 +712,18 @@ mod tests {
         .unwrap();
         assert_eq!(p.url, "https://cdn.example/hls/index_720p.m3u8?token=ab_cd");
         assert_eq!(p.referer.as_deref(), Some("https://embed.example/watch/1"));
+    }
+
+    #[test]
+    fn test_parse_capture_url_bundles_sub_params() {
+        let p = parse_capture_url(
+            "play://open?url=https%3A%2F%2Fcdn.example%2Fa.m3u8&sub=https%3A%2F%2Fcdn.example%2FEnglish.vtt&sub=javascript%3Aalert(1)&sub=https%3A%2F%2Fcdn.example%2FEnglish.vtt",
+        )
+        .unwrap();
+        assert_eq!(
+            p.subtitles.as_deref(),
+            Some(["https://cdn.example/English.vtt".to_string()].as_slice())
+        );
     }
 
     #[test]

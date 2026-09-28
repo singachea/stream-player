@@ -90,17 +90,95 @@ function formatTime(seenAt) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+/** File stem tokens, e.g. "English.vtt" -> ["english"]. */
+function stemTokens(url) {
+  const base = resourcePath(url).split("/").pop() || "";
+  const stem = base.split(".").slice(0, -1).join(".") || base;
+  return stem.toLowerCase().split(/[^a-z]+/).filter(Boolean);
+}
+
+function isEnglishSub(url) {
+  const toks = stemTokens(url);
+  return toks.includes("english") || toks.includes("en") || toks.includes("eng");
+}
+
+/** English first, then newest. */
+function sortSubs(subs) {
+  return subs.sort((a, b) => {
+    const ea = isEnglishSub(a.url) ? 0 : 1;
+    const eb = isEnglishSub(b.url) ? 0 : 1;
+    if (ea !== eb) return ea - eb;
+    return (b.seenAt || 0) - (a.seenAt || 0);
+  });
+}
+
+function streamRows() {
+  return [...items.values()]
+    .filter((v) => !isSub(v.url))
+    .sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0));
+}
+
+function subtitleRows() {
+  return sortSubs([...items.values()].filter((v) => isSub(v.url)));
+}
+
+/** Subtitles captured in the same fetch group as the stream. */
+function subsFor(stream, subs) {
+  if (!stream.batch) return subs;
+  const attached = subs.filter((s) => s.batch === stream.batch);
+  return attached.length ? attached : [];
+}
+
+function downloadSub(url, btn) {
+  btn.disabled = true;
+  const done = (ok, msg) => {
+    setStatus(msg, !ok);
+    btn.disabled = false;
+  };
+  try {
+    const p = chrome.downloads.download({ url, saveAs: false });
+    if (p && typeof p.then === "function") {
+      p.then(() => done(true, "Subtitle saved")).catch(() => done(false, "Download failed"));
+    } else {
+      done(true, "Subtitle saved");
+    }
+  } catch {
+    done(false, "Download failed");
+  }
+}
+
+function subRow(s) {
+  const row = document.createElement("div");
+  row.className = "subrow";
+  const lab = document.createElement("div");
+  lab.className = "sublabel";
+  lab.textContent = `CC ${label(s.url)}`;
+  const dl = document.createElement("button");
+  dl.className = "dl";
+  dl.type = "button";
+  dl.textContent = "Download";
+  dl.addEventListener("click", (e) => {
+    e.stopPropagation();
+    downloadSub(s.url, dl);
+  });
+  row.append(lab, dl);
+  return row;
+}
+
 function render() {
-  const rows = [...items.values()].sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0));
-  if (!rows.length) {
+  const streams = streamRows();
+  const subs = subtitleRows();
+  if (!streams.length && !subs.length) {
     listEl.innerHTML =
       '<div class="empty">No streams on this tab yet. Reload the page, play the video, and watch the badge. Then click here.</div>';
     return;
   }
   // Highlight only the latest fetch group.
+  const rows = [...streams, ...subs];
   const latest = rows.reduce((m, v) => Math.max(m, v.batch || 0), 0);
   listEl.replaceChildren();
-  for (const [i, v] of rows.entries()) {
+  const orphans = subs.filter((s) => !streams.some((st) => subsFor(st, subs).includes(s)));
+  streams.forEach((v, i) => {
     const row = document.createElement("div");
     row.className = "item" + (latest && v.batch === latest ? " fresh" : "");
     const idx = document.createElement("div");
@@ -118,27 +196,41 @@ function render() {
     sub.className = "sub";
     sub.textContent = v.referer || v.initiator || v.url;
     meta.append(name, time, sub);
-    if (isSub(v.url)) {
-      const tag = document.createElement("div");
-      tag.className = "sub";
-      tag.textContent = "subtitle";
-      row.append(idx, meta, tag);
-    } else {
-      const btn = document.createElement("button");
-      btn.className = "send";
-      btn.type = "button";
-      btn.textContent = "Play";
-      btn.addEventListener("click", () => sendToPlay(v, btn));
-      row.append(idx, meta, btn);
-    }
+    for (const s of subsFor(v, subs)) meta.append(subRow(s));
+    const btn = document.createElement("button");
+    btn.className = "send";
+    btn.type = "button";
+    btn.textContent = "Play";
+    btn.addEventListener("click", () => sendToPlay(v, btn));
+    row.append(idx, meta, btn);
     listEl.append(row);
-  }
+  });
+  // Subtitles with no stream in their fetch group stay visible as orphans.
+  orphans.forEach((s, k) => {
+    const row = document.createElement("div");
+    row.className = "item" + (latest && s.batch === latest ? " fresh" : "");
+    const idx = document.createElement("div");
+    idx.className = "idx";
+    idx.textContent = String(streams.length + k + 1);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.append(subRow(s));
+    const time = document.createElement("div");
+    time.className = "time";
+    time.textContent = formatTime(s.seenAt);
+    meta.append(time);
+    const tag = document.createElement("div");
+    tag.className = "sub";
+    tag.textContent = "subtitle";
+    row.append(idx, meta, tag);
+    listEl.append(row);
+  });
 }
 
 function add(value) {
   if (!value?.url) return;
   items.set(value.url, value);
-  const n = items.size;
+  const n = [...items.values()].filter((v) => !isSub(v.url)).length;
   setStatus(n === 1 ? "1 stream" : `${n} streams`);
   render();
 }
@@ -160,9 +252,7 @@ async function sendToPlay(v, btn) {
       return undefined;
     }
   })();
-  const subtitles = [...items.values()]
-    .filter((x) => isSub(x.url))
-    .map((x) => x.url);
+  const subtitles = subsFor(v, subtitleRows()).map((x) => x.url);
   btn.disabled = true;
   try {
     const res = await fetch(PLAY_OPEN, {
@@ -179,7 +269,7 @@ async function sendToPlay(v, btn) {
       }),
     });
     if (res.ok) {
-      setStatus("Sent to Play");
+      setStatus(subtitles.length ? `Sent to Play (+${subtitles.length} subtitles)` : "Sent to Play");
       btn.disabled = false;
       return;
     }
@@ -189,6 +279,7 @@ async function sendToPlay(v, btn) {
   const u = new URL("play://open");
   u.searchParams.set("url", v.url);
   if (referer) u.searchParams.set("referer", referer);
+  for (const s of subtitles) u.searchParams.append("sub", s);
   try {
     await chrome.tabs.create({ url: u.toString() });
     setStatus("Opening Play…");
