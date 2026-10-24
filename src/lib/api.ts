@@ -17,6 +17,7 @@ export type ParsedCurl = {
   cookie?: string | null;
   cookieHost?: string | null;
   subtitles?: string[] | null;
+  title?: string | null;
 };
 
 export function getWorkdir(): Promise<string> {
@@ -68,7 +69,12 @@ export function resolve(
 export function play(
   url: string,
   quality?: string | null,
-  opts: HeaderOpts & { extra?: boolean; subtitles?: string[]; subtitle?: string | null } = {},
+  opts: HeaderOpts & {
+    extra?: boolean;
+    subtitles?: string[];
+    subtitle?: string | null;
+    title?: string | null;
+  } = {},
 ): Promise<ResolveResponse> {
   return invoke("play_cmd", {
     url,
@@ -81,6 +87,7 @@ export function play(
     extra: opts.extra ?? false,
     subtitles: opts.subtitles ?? null,
     subtitle: opts.subtitle ?? null,
+    title: opts.title?.trim() ? opts.title.trim() : null,
   });
 }
 
@@ -94,6 +101,14 @@ export interface StreamSession {
   host: string;
   quality: string;
   status: string;
+  title?: string | null;
+  localUrl?: string | null;
+  port?: number | null;
+  fetchStatus?: string | null;
+  speedBps?: number | null;
+  fetchedBytes?: number;
+  lastError?: string | null;
+  cached?: number[];
   pid?: number | null;
   playhead?: number | null;
   buffered: number;

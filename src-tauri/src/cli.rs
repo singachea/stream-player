@@ -272,7 +272,8 @@ pub fn run_with(argv: Vec<String>) -> crate::error::Result<i32> {
 
     match kind {
         Kind::Http | Kind::Dash => {
-            let mut pb = start_http_playback(&ns.url, &headers, &vlc, ns.verbose, &[], None)?;
+            let mut pb =
+                start_http_playback(&ns.url, &headers, &vlc, ns.verbose, &[], None, None)?;
             let code = wait_for_vlc(&mut pb.child, ns.verbose);
             let _ = pb.child.kill();
             pb.proxy.shutdown();
@@ -291,6 +292,7 @@ pub fn run_with(argv: Vec<String>) -> crate::error::Result<i32> {
                 Some(&mut on_403),
                 None,
                 0,
+                None,
             ) {
                 Ok(mut pb) => {
                     let code = wait_for_vlc(&mut pb.child, ns.verbose);
@@ -302,8 +304,15 @@ pub fn run_with(argv: Vec<String>) -> crate::error::Result<i32> {
                     if ns.verbose {
                         eprintln!("play: not a playlist, playing as a file");
                     }
-                    let mut pb =
-                        start_http_playback(&ns.url, &headers, &vlc, ns.verbose, &[], None)?;
+                    let mut pb = start_http_playback(
+                        &ns.url,
+                        &headers,
+                        &vlc,
+                        ns.verbose,
+                        &[],
+                        None,
+                        None,
+                    )?;
                     let code = wait_for_vlc(&mut pb.child, ns.verbose);
                     let _ = pb.child.kill();
                     pb.proxy.shutdown();

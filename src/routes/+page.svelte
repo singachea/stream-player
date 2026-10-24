@@ -19,10 +19,14 @@
   import ToastStack from "$lib/components/ToastStack.svelte";
   import RefererDialog from "$lib/components/RefererDialog.svelte";
   import DebugLog from "$lib/components/DebugLog.svelte";
+  import DiagnosticsPane from "$lib/components/DiagnosticsPane.svelte";
   import JobsPane from "$lib/components/JobsPane.svelte";
+  import SettingsPane from "$lib/components/SettingsPane.svelte";
   import StreamsPane from "$lib/components/StreamsPane.svelte";
 
   let url = $state("");
+  let title = $state("");
+  let tab = $state<"player" | "diagnostics" | "settings">("player");
   let referer = $state("");
   let origin = $state("");
   let userAgent = $state("");
@@ -44,7 +48,7 @@
   let resolving = $state(false);
   let playing = $state(false);
   let extraCount = $state(0);
-  let playMenu = $state(false);
+  let pasteMenu = $state(false);
   let jobs = $state<Job[]>([]);
   let streams = $state<api.StreamSession[]>([]);
   let needReferer = $state<NeedReferer | null>(null);
@@ -56,7 +60,7 @@
   let logs = $state<LogLine[]>([]);
   let logFilter = $state<LogFilter>({ kind: "all" });
   const visibleLogs = $derived(logs.filter((l) => matchLog(l, logFilter)));
-  let urlBox: HTMLTextAreaElement | undefined = $state();
+  let urlBox: HTMLInputElement | undefined = $state();
   let lastClipOffer = $state("");
   let subtitles = $state<string[]>([]);
   let dlConfig = $state<DownloadConfig>({
@@ -282,6 +286,11 @@
     function onFocus() {
       void offerClipboard();
     }
+    function onDocClick(ev: MouseEvent) {
+      const t = ev.target as HTMLElement | null;
+      if (t && !t.closest("[data-paste-split]")) pasteMenu = false;
+    }
+    document.addEventListener("click", onDocClick);
     window.addEventListener("focus", onFocus);
     void offerClipboard();
     startStreamPolling();
@@ -303,11 +312,6 @@
         },
       ];
     }).then((u) => unsubs.push(u));
-    function onDocClick(ev: MouseEvent) {
-      const t = ev.target as HTMLElement | null;
-      if (t && !t.closest("[data-play-split]")) playMenu = false;
-    }
-    document.addEventListener("click", onDocClick);
     return () => {
       unsubs.forEach((u) => u());
       document.removeEventListener("click", onDocClick);
@@ -450,6 +454,7 @@
     source: string,
   ) {
     url = parsed.url;
+    title = (parsed.title || "").trim();
     subtitles = (parsed.subtitles || []).filter((s) => /^https?:\/\//i.test(s));
     cookie = parsed.cookie || "";
     cookieHost = (parsed.cookieHost || "").toLowerCase();
@@ -483,6 +488,7 @@
     const next = text.replace(/[\r\n]+/g, "").trim();
     if (!next) return false;
     url = next;
+    title = "";
     subtitles = [];
     applyRefererForUrl(next);
     cookie = "";
@@ -547,7 +553,6 @@
   }
 
   async function doPlay(extra = false) {
-    playMenu = false;
     if (!canPlay) return;
     const u = cleanUrl(url);
     busy = true;
@@ -562,6 +567,7 @@
         extra,
         subtitles,
         subtitle,
+        title: title.trim() || null,
       });
       pendingAfterReferer = "play";
       if (!applyPlayResult(res)) return;
@@ -584,7 +590,6 @@
   }
 
   async function doDownload() {
-    playMenu = false;
     const u = cleanUrl(url);
     if (!u) return;
     let dest: string;
@@ -741,28 +746,32 @@
 </script>
 
 <div class="flex h-full flex-col bg-surface-950 text-surface-100">
-  <header
-    class="flex items-center gap-3 border-b border-surface-800 bg-surface-900 px-4 py-2.5"
+  <div
+    class="flex items-center gap-1 border-b border-surface-800 bg-surface-900 px-4 py-1.5"
+    role="tablist"
+    aria-label="Top level"
   >
-    <div
-      class="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-600 text-sm font-semibold text-white"
-    >
-      ▶
-    </div>
-    <div>
-      <h1 class="text-sm font-semibold leading-none">Play</h1>
-      <p class="mt-0.5 text-xs text-surface-400">HLS in VLC, with seeking</p>
-    </div>
-    <button
-      type="button"
-      class="ml-auto max-w-md truncate rounded-lg border border-surface-700 bg-surface-850 px-3 py-1.5 text-xs text-surface-300 hover:bg-surface-800"
-      onclick={pickFolder}
-      title="Folder for .play.json"
-    >
-      {workdir || "Choose folder"}
-    </button>
-  </header>
+    {#each [{ id: "player", label: "Player" }, { id: "diagnostics", label: "Diagnostics" }, { id: "settings", label: "Settings" }] as t (t.id)}
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === t.id}
+        class="rounded-lg px-3 py-1.5 text-sm font-medium {tab === t.id
+          ? 'bg-surface-800 text-surface-100'
+          : 'text-surface-400 hover:bg-surface-850 hover:text-surface-200'}"
+        onclick={() => (tab = t.id as typeof tab)}
+      >
+        {t.label}
+        {#if t.id === "diagnostics" && streams.length > 0}
+          <span class="ml-1 text-xs font-normal text-accent-400"
+            >{streams.length}</span
+          >
+        {/if}
+      </button>
+    {/each}
+  </div>
 
+  {#if tab === "player"}
   <main class="flex min-h-0 flex-1">
     <StreamsPane
       {streams}
@@ -780,14 +789,15 @@
           <span class="text-xs text-accent-400">Listing qualities…</span>
         {/if}
       </div>
-      <div class="mt-1.5 flex items-start gap-2">
-        <textarea
+      <div class="mt-1.5 flex items-center gap-2">
+        <input
           id="stream-url"
           bind:this={urlBox}
-          class="min-h-[5.5rem] flex-1 resize-y rounded-lg border border-surface-600 bg-surface-850 px-3 py-2 font-mono text-sm leading-5 outline-none ring-accent-500 focus:border-accent-500 focus:ring-2"
+          class="min-w-0 flex-1 rounded-lg border border-surface-600 bg-surface-850 px-3 py-2 font-mono text-sm outline-none ring-accent-500 focus:border-accent-500 focus:ring-2"
+          type="text"
           placeholder="https://cdn.example/hls/master.m3u8 or paste Copy as cURL"
           spellcheck="false"
-          wrap="soft"
+          autocomplete="off"
           bind:value={url}
           oninput={scheduleResolve}
           onpaste={(e) => {
@@ -802,68 +812,83 @@
             })();
           }}
           onkeydown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey || !e.shiftKey)) {
               e.preventDefault();
               void doPlay(false);
             }
           }}
-        ></textarea>
-        <div class="flex w-28 shrink-0 flex-col gap-2" data-play-split>
-          <button
-            type="button"
-            class="rounded-lg border border-surface-600 bg-surface-800 px-3 py-2 text-sm font-medium text-surface-100 hover:bg-surface-700"
-            onclick={pasteUrl}
-            title="Paste URL or Copy as cURL from DevTools"
-          >
-            Paste
-          </button>
-          <div class="relative flex w-full">
-            <button
-              type="button"
-              class="min-w-0 flex-1 rounded-l-lg bg-accent-600 px-3 py-2 text-sm font-semibold text-white shadow hover:bg-accent-500 disabled:opacity-45"
-              onclick={() => doPlay(false)}
-              disabled={!canPlay}
-            >
-              {playingOp === "play" ? "Opening…" : "Play"}
-            </button>
-            <button
-              type="button"
-              class="rounded-r-lg border-l border-accent-500/70 bg-accent-600 px-2 text-white hover:bg-accent-500 disabled:opacity-45"
-              onclick={(e) => {
-                e.stopPropagation();
-                playMenu = !playMenu;
-              }}
-              disabled={!cleanUrl(url) || playingOp !== null}
-              aria-label="More play options"
-            >
-              ▾
-            </button>
-            {#if playMenu}
+        />
+        <div class="grid shrink-0 grid-cols-[auto_auto_auto] items-center gap-2">
+          <div class="relative col-start-1 row-start-1" data-paste-split>
+            <div class="flex">
+              <button
+                type="button"
+                class="rounded-l-lg border border-surface-600 bg-surface-800 px-3 py-2 text-sm font-medium text-surface-100 hover:bg-surface-700"
+                onclick={() => {
+                  pasteMenu = false;
+                  void pasteUrl();
+                }}
+                title="Paste URL or Copy as cURL from DevTools"
+              >
+                Paste
+              </button>
+              <button
+                type="button"
+                class="rounded-r-lg border border-l-0 border-surface-600 bg-surface-800 px-2 text-surface-300 hover:bg-surface-700"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  pasteMenu = !pasteMenu;
+                }}
+                aria-label="More paste options"
+                aria-expanded={pasteMenu}
+                title="More paste options"
+              >
+                ▾
+              </button>
+            </div>
+            {#if pasteMenu}
               <div
-                class="absolute left-0 right-0 top-full z-20 mt-1 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 py-1 shadow-xl"
+                class="absolute left-0 top-full z-20 mt-1 min-w-36 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 py-1 shadow-xl"
               >
                 <button
                   type="button"
-                  class="block w-full px-3 py-2 text-left text-sm text-surface-100 hover:bg-surface-800"
-                  onclick={() => doPlay(true)}
-                >
-                  Play +1
-                </button>
-                <button
-                  type="button"
-                  class="block w-full px-3 py-2 text-left text-sm text-surface-100 hover:bg-surface-800"
+                  class="block w-full px-3 py-2 text-left text-sm text-surface-100 hover:bg-surface-800 disabled:opacity-45"
+                  disabled={!cleanUrl(url)}
                   onclick={() => {
-                    playMenu = false;
+                    pasteMenu = false;
                     void doDownload();
                   }}
+                  title="Download this stream to a file"
                 >
                   Download
                 </button>
               </div>
             {/if}
           </div>
+          <button
+            type="button"
+            class="col-start-2 row-start-1 rounded-lg border border-accent-600 bg-accent-600/15 px-3 py-2 text-sm font-medium text-accent-400 hover:bg-accent-600/25 disabled:opacity-45"
+            onclick={() => doPlay(true)}
+            disabled={!canPlay}
+            title="Open another VLC instance"
+          >
+            {playingOp === "play" ? "Opening…" : "Play +1"}
+          </button>
+          <button
+            type="button"
+            class="col-start-3 row-start-1 rounded-lg bg-accent-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-accent-500 disabled:opacity-45"
+            onclick={() => doPlay(false)}
+            disabled={!canPlay}
+          >
+            {playingOp === "play" ? "Opening…" : "Play"}
+          </button>
         </div>
       </div>
+      {#if title.trim()}
+        <p class="mt-1.5 truncate text-[11px] text-surface-400" title={title.trim()}>
+          From: {title.trim()}
+        </p>
+      {/if}
       <p class="mt-1.5 text-[11px] leading-4 text-surface-500">
         Or send from the Send to Play extension in Brave.
       </p>
@@ -1066,6 +1091,20 @@
       onWorkers={(n) => void setWorkers(n)}
     />
   </main>
+  {:else if tab === "diagnostics"}
+  <main class="flex min-h-0 flex-1">
+    <DiagnosticsPane
+      {streams}
+      {jobs}
+      logTotal={logs.length}
+      onStopStream={(id) => void stopStream(id)}
+    />
+  </main>
+  {:else}
+  <main class="flex min-h-0 flex-1">
+    <SettingsPane {workdir} onPick={() => void pickFolder()} />
+  </main>
+  {/if}
 
   <footer
     class="flex items-center gap-3 border-t border-surface-800 bg-surface-900 px-4 py-1.5 text-xs text-surface-400"

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Send to Play",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "Detect HLS/DASH playlists, mp4 files, and subtitles on the current tab and send them to Play",
   "action": {
     "default_title": "Send to Play",

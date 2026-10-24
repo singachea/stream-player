@@ -264,6 +264,7 @@ pub fn start_hls_playback<F>(
     mut on_403: Option<&mut F>,
     mut on_stage: Option<&mut PlayStage>,
     prefetch_count: usize,
+    title: Option<&str>,
 ) -> Result<Playback>
 where
     F: FnMut(&str, &mut HashMap<String, String>, &[u8]) -> Option<HashMap<String, String>> + ?Sized,
@@ -333,13 +334,16 @@ where
             }
         }
     }
-    let video_url = proxy.playlist_url();
+    let video_url = proxy.playlist_url_with(title);
     let (play_url, embedded) = if !hls_subs.is_empty() {
-        files.insert(
-            "/master.m3u8".into(),
-            local_master_playlist(&video_url, &hls_subs).into_bytes(),
-        );
-        (proxy.master_url(), true)
+        let master_body = local_master_playlist(&video_url, &hls_subs).into_bytes();
+        // Keep the legacy path working; VLC opens the title-named one.
+        files.insert("/master.m3u8".into(), master_body.clone());
+        let master_path = format!("/{}", crate::urls::master_filename(title));
+        if master_path != "/master.m3u8" {
+            files.insert(master_path, master_body);
+        }
+        (proxy.master_url_with(title), true)
     } else {
         (video_url, false)
     };
@@ -467,11 +471,12 @@ pub fn start_http_playback(
     verbose: bool,
     extra_subs: &[String],
     mut on_stage: Option<&mut PlayStage>,
+    title: Option<&str>,
 ) -> Result<Playback> {
     emit_stage_opt(&mut on_stage, "proxy", 0, 2, None);
     let full = crate::urls::strip_range_query(url);
     let proxy = start_file_proxy(full, headers.clone(), verbose)?;
-    let local = proxy.file_url();
+    let local = proxy.file_url_with(title);
     let mut sidecar = Vec::new();
     let mut staged: Vec<std::path::PathBuf> = Vec::new();
     if !extra_subs.is_empty() {

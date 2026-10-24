@@ -298,6 +298,62 @@ pub struct ParsedCurl {
     pub cookie_host: Option<String>,
     #[serde(default)]
     pub subtitles: Option<Vec<String>>,
+    /// Container page title sent by the extension (e.g. the tab title), so
+    /// the local proxy can serve `<title>.m3u8` / `<title>.mp4` and VLC
+    /// shows a meaningful stream name instead of `index.m3u8` / `file.mp4`.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// VLC shows the local proxy filename as the stream name. Map an arbitrary
+/// page title to a safe filename stem: keep `[A-Za-z0-9_-]`, fold anything
+/// else (including whitespace) to `_`, collapse runs, trim edge `_`/`.`,
+/// cap at 60 chars. Returns None when nothing usable remains.
+pub fn sanitize_title(raw: Option<&str>) -> Option<String> {
+    let t = raw?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut last_underscore = false;
+    for c in t.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+            last_underscore = false;
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+        if out.len() >= 60 {
+            break;
+        }
+    }
+    let stem = out.trim_matches(['_', '.']).to_string();
+    if stem.is_empty() { None } else { Some(stem) }
+}
+
+/// Local HLS playlist filename: `<title>.m3u8`, falling back to `index.m3u8`.
+pub fn playlist_filename(title: Option<&str>) -> String {
+    match sanitize_title(title) {
+        Some(stem) => format!("{stem}.m3u8"),
+        None => "index.m3u8".into(),
+    }
+}
+
+/// Local master playlist filename for subtitle-bundled sessions.
+pub fn master_filename(title: Option<&str>) -> String {
+    match sanitize_title(title) {
+        Some(stem) => format!("{stem}-master.m3u8"),
+        None => "master.m3u8".into(),
+    }
+}
+
+/// Local progressive-file filename: `<title>.mp4`, falling back to `file.mp4`.
+pub fn media_filename(title: Option<&str>) -> String {
+    match sanitize_title(title) {
+        Some(stem) => format!("{stem}.mp4"),
+        None => "file.mp4".into(),
+    }
 }
 
 fn looks_like_curl(text: &str) -> bool {
@@ -436,6 +492,7 @@ pub fn parse_curl(text: &str) -> Option<ParsedCurl> {
         cookie,
         cookie_host: None,
         subtitles: None,
+        title: None,
     })
 }
 
@@ -448,18 +505,33 @@ fn http_https(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+fn clean_title(v: &str) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Cap raw input; sanitize_title caps the stem again.
+    Some(t.chars().take(200).collect::<String>())
+}
+
 fn capture_from_pairs<'a>(
     pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
 ) -> Option<ParsedCurl> {
     let mut url = None;
     let mut referer = None;
     let mut origin = None;
+    let mut title: Option<String> = None;
     let mut subtitles = Vec::new();
     for (k, v) in pairs {
         match k.as_ref() {
             "url" => url = http_https(&v),
             "referer" | "initiator" => referer = http_https(&v),
             "origin" => origin = http_https(&v),
+            "title" => {
+                if title.is_none() {
+                    title = clean_title(&v);
+                }
+            }
             // Repeated `sub=` params from the extension play:// fallback.
             // Each value is validated as http(s) before bundling.
             "sub" | "subtitle" | "subtitles" => {
@@ -485,6 +557,7 @@ fn capture_from_pairs<'a>(
         cookie: None,
         cookie_host: None,
         subtitles,
+        title,
     })
 }
 
@@ -508,7 +581,7 @@ pub fn parse_capture_query(query: &str) -> Option<ParsedCurl> {
     capture_from_pairs(parsed.query_pairs())
 }
 
-/// JSON `{url, referer?, frame?, origin?, initiator?, userAgent?, cookie?, cookieHost?, subtitles?}` from the extension POST.
+/// JSON `{url, referer?, frame?, origin?, initiator?, userAgent?, cookie?, cookieHost?, subtitles?, title?}` from the extension POST.
 pub fn parse_capture_json(body: &str) -> Option<ParsedCurl> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -522,6 +595,7 @@ pub fn parse_capture_json(body: &str) -> Option<ParsedCurl> {
         cookie: Option<String>,
         cookie_host: Option<String>,
         subtitles: Option<Vec<String>>,
+        title: Option<String>,
     }
     let b: Body = serde_json::from_str(body.trim()).ok()?;
     let url = http_https(&b.url)?;
@@ -565,6 +639,7 @@ pub fn parse_capture_json(body: &str) -> Option<ParsedCurl> {
         cookie,
         cookie_host,
         subtitles,
+        title: b.title.as_deref().and_then(clean_title),
     })
 }
 
@@ -815,6 +890,53 @@ mod tests {
         .unwrap();
         assert_eq!(p.url, "https://cdn.example/a.m3u8");
         assert_eq!(p.referer.as_deref(), Some("https://embed.example/"));
+    }
+
+    #[test]
+    fn test_sanitize_title_maps_to_safe_stem() {
+        assert_eq!(
+            sanitize_title(Some("My Show: S01 E02 (2024)")),
+            Some("My_Show_S01_E02_2024".into())
+        );
+        assert_eq!(
+            sanitize_title(Some("  spaced   out  ")),
+            Some("spaced_out".into())
+        );
+        assert_eq!(sanitize_title(Some("   ")), None);
+        assert_eq!(sanitize_title(Some("!!!")), None);
+        assert_eq!(sanitize_title(None), None);
+        let long = "a".repeat(200);
+        assert_eq!(sanitize_title(Some(&long)).unwrap().len(), 60);
+    }
+
+    #[test]
+    fn test_title_filenames_fall_back_without_title() {
+        assert_eq!(playlist_filename(Some("My Show!")), "My_Show.m3u8");
+        assert_eq!(playlist_filename(None), "index.m3u8");
+        assert_eq!(media_filename(Some("My Show!")), "My_Show.mp4");
+        assert_eq!(media_filename(None), "file.mp4");
+        assert_eq!(master_filename(Some("My Show!")), "My_Show-master.m3u8");
+        assert_eq!(master_filename(None), "master.m3u8");
+    }
+
+    #[test]
+    fn test_parse_capture_json_title() {
+        let p = parse_capture_json(
+            r#"{"url":"https://cdn.example/a.m3u8","title":"My Show S01E02"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.title.as_deref(), Some("My Show S01E02"));
+        let p = parse_capture_json(r#"{"url":"https://cdn.example/a.m3u8"}"#).unwrap();
+        assert_eq!(p.title, None);
+    }
+
+    #[test]
+    fn test_parse_capture_query_title() {
+        let p = parse_capture_query(
+            "url=https%3A%2F%2Fcdn.example%2Fa.m3u8&title=My%20Show",
+        )
+        .unwrap();
+        assert_eq!(p.title.as_deref(), Some("My Show"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tiny_http::{Header, Response, Server, StatusCode};
 
@@ -31,6 +31,19 @@ pub struct ProxyState {
     pub served_count: u64,
     /// Cached bytes currently held.
     pub cached_bytes: u64,
+    /// Cumulative upstream segment bytes fetched (cache + on-demand).
+    pub fetched_bytes: u64,
+    /// Upstream fetches currently in flight.
+    pub fetch_inflight: usize,
+    /// Epoch ms of the last successful upstream fetch/request.
+    pub last_ok_ms: u64,
+    /// Epoch ms of the last failed upstream fetch, 0 when never failed.
+    pub last_error_ms: u64,
+    /// Last upstream failure message, for the Diagnostics view.
+    pub last_error: Option<String>,
+    /// (epoch ms, bytes) of recent successful fetches, pruned to ~10s.
+    /// Drives the download-speed readout; zero-byte marks are not stored.
+    pub recent: VecDeque<(u64, u64)>,
     pub verbose: bool,
     pub source: Option<String>,
     pub on_log: Option<Arc<dyn Fn(&str, String) + Send + Sync>>,
@@ -59,6 +72,22 @@ impl Clone for ProxyHandle {
 }
 
 impl ProxyHandle {
+    /// Local playlist URL named after the stream title when available, so
+    /// VLC shows `<title>.m3u8` instead of `index.m3u8`.
+    pub fn playlist_url_with(&self, title: Option<&str>) -> String {
+        format!("{}/{}", self.base, crate::urls::playlist_filename(title))
+    }
+
+    /// Local master URL for subtitle-bundled sessions, title-named likewise.
+    pub fn master_url_with(&self, title: Option<&str>) -> String {
+        format!("{}/{}", self.base, crate::urls::master_filename(title))
+    }
+
+    /// Local progressive-file URL: `<title>.mp4` instead of `file.mp4`.
+    pub fn file_url_with(&self, title: Option<&str>) -> String {
+        format!("{}/{}", self.base, crate::urls::media_filename(title))
+    }
+
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.server.unblock();
@@ -78,6 +107,95 @@ impl ProxyHandle {
     pub fn file_url(&self) -> String {
         format!("{}/file.mp4", self.base)
     }
+
+    /// Loopback port VLC connects to, for the Diagnostics view.
+    pub fn port(&self) -> Option<u16> {
+        self.base.rsplit(':').next()?.parse().ok()
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Mark an upstream fetch start. Callers must pair with exactly one of
+/// `note_fetch_ok` / `note_fetch_err`.
+pub(crate) fn note_fetch_begin(state: &Mutex<ProxyState>) {
+    state.lock().unwrap().fetch_inflight += 1;
+}
+
+/// Mark a successful upstream fetch of `bytes` bytes. Zero-byte marks
+/// (progressive-file requests, whose bodies stream through curl) refresh
+/// recency but do not feed the speed average.
+pub(crate) fn note_fetch_ok(state: &Mutex<ProxyState>, bytes: u64) {
+    let mut st = state.lock().unwrap();
+    st.fetch_inflight = st.fetch_inflight.saturating_sub(1);
+    let now = now_ms();
+    st.last_ok_ms = now;
+    st.fetched_bytes += bytes;
+    if bytes > 0 {
+        st.recent.push_back((now, bytes));
+        while st.recent.len() > 256 {
+            st.recent.pop_front();
+        }
+    }
+}
+
+/// Mark a failed upstream fetch with a one-line diagnosis.
+pub(crate) fn note_fetch_err(state: &Mutex<ProxyState>, msg: String) {
+    let mut st = state.lock().unwrap();
+    st.fetch_inflight = st.fetch_inflight.saturating_sub(1);
+    st.last_error_ms = now_ms();
+    st.last_error = Some(msg);
+}
+
+/// Recent download speed in bytes/sec over the trailing ~10s window.
+/// Returns None when nothing was fetched recently.
+pub(crate) fn recent_speed_bps(recent: &VecDeque<(u64, u64)>, now_ms: u64) -> Option<u64> {
+    const WINDOW_MS: u64 = 10_000;
+    let mut bytes = 0u64;
+    let mut oldest = now_ms;
+    let mut n = 0usize;
+    for (ms, b) in recent.iter() {
+        if now_ms.saturating_sub(*ms) <= WINDOW_MS {
+            bytes += b;
+            oldest = oldest.min(*ms);
+            n += 1;
+        }
+    }
+    if n == 0 || bytes == 0 {
+        return None;
+    }
+    let span_ms = now_ms.saturating_sub(oldest).max(1);
+    Some(bytes.saturating_mul(1000) / span_ms)
+}
+
+/// Session fetch status for the Diagnostics view: `downloading` (green,
+/// upstream traffic in flight or within the last 5s), `buffered` (yellow,
+/// idle with the readahead window full), `error` (red, the latest upstream
+/// result within the last 30s was a failure), else `idle`.
+pub(crate) fn fetch_status(
+    total: usize,
+    buffered: usize,
+    want: usize,
+    inflight: usize,
+    last_ok_ms: u64,
+    last_error_ms: u64,
+    now_ms: u64,
+) -> &'static str {
+    if last_error_ms > last_ok_ms && now_ms.saturating_sub(last_error_ms) < 30_000 {
+        return "error";
+    }
+    if inflight > 0 || (last_ok_ms > 0 && now_ms.saturating_sub(last_ok_ms) < 5_000) {
+        return "downloading";
+    }
+    if total > 0 && buffered >= want {
+        return "buffered";
+    }
+    "idle"
 }
 
 impl Drop for ProxyHandle {
@@ -112,6 +230,12 @@ pub fn start_proxy(
         served_max: None,
         served_count: 0,
         cached_bytes: 0,
+        fetched_bytes: 0,
+        fetch_inflight: 0,
+        last_ok_ms: 0,
+        last_error_ms: 0,
+        last_error: None,
+        recent: VecDeque::new(),
         verbose,
         source: None,
         on_log: None,
@@ -185,15 +309,19 @@ fn fill_cache(
             continue;
         }
         let mut hdrs = headers.clone();
+        note_fetch_begin(&handle.state);
         match fetch_segment_body(src, &mut hdrs, rest_ext) {
             Some(body) => {
+                let bytes = body.len() as u64;
+                note_fetch_ok(&handle.state, bytes);
                 let mut st = handle.state.lock().unwrap();
-                st.cached_bytes += body.len() as u64;
+                st.cached_bytes += bytes;
                 st.seg_cache.insert(n, body);
                 drop(st);
                 on_step(n - start + 1, total);
             }
             None => {
+                note_fetch_err(&handle.state, format!("prefetch seg {n} {src} → upstream failed"));
                 on_step(n - start, total);
                 break;
             }
@@ -223,13 +351,19 @@ pub fn readahead(handle: &ProxyHandle, from: usize, count: usize) {
             break;
         };
         let mut hdrs = headers.clone();
+        note_fetch_begin(&handle.state);
         match fetch_segment_body(src, &mut hdrs, rest_ext) {
             Some(body) => {
+                let bytes = body.len() as u64;
+                note_fetch_ok(&handle.state, bytes);
                 let mut st = handle.state.lock().unwrap();
-                st.cached_bytes += body.len() as u64;
+                st.cached_bytes += bytes;
                 st.seg_cache.insert(n, body);
             }
-            None => break,
+            None => {
+                note_fetch_err(&handle.state, format!("readahead seg {n} → upstream failed"));
+                break;
+            }
         }
     }
 }
@@ -303,13 +437,19 @@ fn fill_range(
             break;
         };
         let mut hdrs = headers.clone();
+        note_fetch_begin(state);
         match fetch_segment_body(src, &mut hdrs, rest_ext) {
             Some(body) => {
+                let bytes = body.len() as u64;
+                note_fetch_ok(state, bytes);
                 let mut st = state.lock().unwrap();
-                st.cached_bytes += body.len() as u64;
+                st.cached_bytes += bytes;
                 st.seg_cache.insert(n, body);
             }
-            None => break,
+            None => {
+                note_fetch_err(state, format!("readahead seg {n} → upstream failed"));
+                break;
+            }
         }
     }
 }
@@ -432,7 +572,17 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
         stream_file(request, &src, state);
         return;
     }
-    if path == "/" || path == "/index.m3u8" || path == "/playlist.m3u8" {
+    // The playlist may be served under a title-based name
+    // (`/<title>.m3u8`); anything ending in .m3u8 outside /seg/ and /sub/
+    // is the playlist. /master.m3u8 and /sub/*.m3u8 resolve from `files`
+    // above first, so this branch never shadows them.
+    if path == "/"
+        || path == "/index.m3u8"
+        || path == "/playlist.m3u8"
+        || (path.ends_with(".m3u8")
+            && !path.starts_with("/seg/")
+            && !path.starts_with("/sub/"))
+    {
         let body = state.lock().unwrap().playlist.clone();
         let resp = Response::new(
             StatusCode(200),
@@ -514,11 +664,14 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
             }
             return;
         }
+        note_fetch_begin(&**state);
         match fetch_segment_body(&src, &mut hdrs, rest) {
             Some(body) => {
+                let bytes = body.len() as u64;
+                note_fetch_ok(&**state, bytes);
                 {
                     let mut st = state.lock().unwrap();
-                    st.cached_bytes += body.len() as u64;
+                    st.cached_bytes += bytes;
                     st.seg_cache.insert(idx, body.clone());
                     st.served_count += 1;
                     st.served_cur = Some(idx);
@@ -529,11 +682,9 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
             }
             None => {
                 let (_, detail) = segment_fetch_detail(&src, &mut hdrs);
-                proxy_log(
-                    state,
-                    "error",
-                    format!("seg {idx} {src} → upstream failed{detail}"),
-                );
+                let msg = format!("seg {idx} {src} → upstream failed{detail}");
+                note_fetch_err(&**state, msg.clone());
+                proxy_log(state, "error", msg);
                 let _ =
                     request.respond(Response::from_string("upstream failed").with_status_code(502));
             }
@@ -544,6 +695,9 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
 }
 
 fn stream_file(request: tiny_http::Request, src: &str, state: &Mutex<ProxyState>) {
+    // Bodies stream through curl, so byte counts are unknown: mark activity
+    // only, which keeps the session status truthful without skewing speed.
+    note_fetch_begin(state);
     let headers = state.lock().unwrap().headers.clone();
     let is_head = *request.method() == tiny_http::Method::Head;
     let range = request
@@ -599,6 +753,7 @@ fn stream_file(request: tiny_http::Request, src: &str, state: &Mutex<ProxyState>
         Ok(c) => c,
         Err(_) => {
             let _ = fs::remove_dir_all(&dir);
+            note_fetch_err(state, format!("file {src} → curl spawn failed"));
             let _ = request.respond(Response::from_string("curl").with_status_code(502));
             return;
         }
@@ -616,11 +771,9 @@ fn stream_file(request: tiny_http::Request, src: &str, state: &Mutex<ProxyState>
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);
-        proxy_log(
-            state,
-            "error",
-            format!("file {src} → HTTP {}", if code == 0 { 502 } else { code }),
-        );
+        let msg = format!("file {src} → HTTP {}", if code == 0 { 502 } else { code });
+        note_fetch_err(state, msg.clone());
+        proxy_log(state, "error", msg);
         let _ = request.respond(
             Response::from_string(format!("upstream {code}")).with_status_code(if code == 0 {
                 502
@@ -630,6 +783,7 @@ fn stream_file(request: tiny_http::Request, src: &str, state: &Mutex<ProxyState>
         );
         return;
     }
+    note_fetch_ok(state, 0);
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
@@ -751,5 +905,47 @@ mod tests {
         assert_eq!(readahead_window(5, 0), 1);
         assert_eq!(readahead_window(10, 10), 0);
         assert_eq!(readahead_window(0, 0), 0);
+    }
+
+    #[test]
+    fn test_fetch_status_error_beats_everything() {
+        let now = 1_000_000u64;
+        // Latest result failed 1s ago: red even with traffic in flight.
+        assert_eq!(fetch_status(100, 10, 10, 1, now - 2_000, now - 1_000, now), "error");
+        // Stale failure (older than 30s) with a newer success: not red.
+        assert_eq!(fetch_status(100, 10, 10, 0, now - 1_000, now - 60_000, now), "downloading");
+        // Stale failure and idle: falls through to buffered.
+        assert_eq!(fetch_status(100, 10, 10, 0, 0, now - 60_000, now), "buffered");
+    }
+
+    #[test]
+    fn test_fetch_status_downloading_buffered_idle() {
+        let now = 1_000_000u64;
+        // In flight counts as downloading even with a full window.
+        assert_eq!(fetch_status(100, 10, 10, 2, 0, 0, now), "downloading");
+        // Success 1s ago counts as downloading.
+        assert_eq!(fetch_status(100, 10, 10, 0, now - 1_000, 0, now), "downloading");
+        // Idle with the readahead window full: yellow.
+        assert_eq!(fetch_status(100, 10, 10, 0, now - 60_000, 0, now), "buffered");
+        // Idle with a gap ahead: not buffered.
+        assert_eq!(fetch_status(100, 3, 10, 0, now - 60_000, 0, now), "idle");
+        // Fresh session, nothing yet.
+        assert_eq!(fetch_status(0, 0, 0, 0, 0, 0, now), "idle");
+    }
+
+    #[test]
+    fn test_recent_speed_bps_uses_trailing_window() {
+        let now = 1_000_000u64;
+        let empty: VecDeque<(u64, u64)> = VecDeque::new();
+        assert_eq!(recent_speed_bps(&empty, now), None);
+        // 1 MB over the last 2s → ~500_000 B/s.
+        let recent = VecDeque::from([(now - 2_000, 1_000_000u64)]);
+        assert_eq!(recent_speed_bps(&recent, now), Some(500_000));
+        // Samples older than 10s are ignored.
+        let stale = VecDeque::from([(now - 60_000, 9_000_000u64)]);
+        assert_eq!(recent_speed_bps(&stale, now), None);
+        // Mixed: only the fresh byte counts contribute.
+        let mixed = VecDeque::from([(now - 60_000, 9_000_000u64), (now - 1_000, 200_000u64)]);
+        assert_eq!(recent_speed_bps(&mixed, now), Some(200_000));
     }
 }

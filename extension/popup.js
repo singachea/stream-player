@@ -253,6 +253,24 @@ async function sendToPlay(v, btn) {
     }
   })();
   const subtitles = subsFor(v, subtitleRows()).map((x) => x.url);
+  // Always name the container host: fresh tab title first, stored entry
+  // title next, stream host last so the field is never empty.
+  let title = (v.title || "").trim();
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const fresh = (tab?.title || "").trim();
+    if (fresh) title = fresh;
+  } catch {
+    /* tab gone; keep stored title */
+  }
+  if (!title) {
+    try {
+      title = new URL(resourceUrl(v.url)).hostname.replace(/^www\./, "");
+    } catch {
+      title = "";
+    }
+  }
+  title = title.slice(0, 200);
   btn.disabled = true;
   try {
     const res = await fetch(PLAY_OPEN, {
@@ -266,6 +284,7 @@ async function sendToPlay(v, btn) {
         cookie: v.cookie || undefined,
         cookieHost: v.cookieHost || undefined,
         subtitles: subtitles.length ? subtitles : undefined,
+        title: title || undefined,
       }),
     });
     if (res.ok) {
@@ -279,6 +298,7 @@ async function sendToPlay(v, btn) {
   const u = new URL("play://open");
   u.searchParams.set("url", v.url);
   if (referer) u.searchParams.set("referer", referer);
+  if (title) u.searchParams.set("title", title);
   for (const s of subtitles) u.searchParams.append("sub", s);
   try {
     await chrome.tabs.create({ url: u.toString() });

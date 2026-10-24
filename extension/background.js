@@ -239,6 +239,28 @@ function pickReferer(...candidates) {
   return http.sort((a, b) => b.length - a.length)[0];
 }
 
+/** Container host title for the entry: tab title first, host fallback so
+ *  Play can name the local proxy file (`<title>.m3u8` / `<title>.mp4`). */
+async function containerTitle(tabId, playUrl) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const t = (tab?.title || "").trim();
+    if (t) return t.slice(0, 200);
+    const pending = (tab?.pendingUrl || tab?.url || "").trim();
+    if (pending) {
+      try {
+        const h = new URL(pending).hostname.replace(/^www\./, "");
+        if (h) return h.slice(0, 200);
+      } catch {
+        /* fall through */
+      }
+    }
+  } catch {
+    /* tab gone */
+  }
+  return siteOf(playUrl);
+}
+
 async function remember(tabId, url, extra, frameId) {
   if (!tabId || tabId < 0 || !url || !isHttpUrl(url) || isOurCapture(url)) return;
   const playUrl = resourceUrl(url);
@@ -257,8 +279,10 @@ async function remember(tabId, url, extra, frameId) {
     .find((u) => u && isHttpUrl(u)) || "";
   const origin = [extra.origin, frame && originOf(frame), prev.origin]
     .filter((u) => u && u.startsWith("http"))[0] || "";
+  const title = (extra.title && extra.title.trim()) || (await containerTitle(tabId, playUrl)) || prev.title || "";
   const next = {
     url: playUrl,
+    title,
     seenAt: prev.seenAt || Date.now(),
     // Group URLs discovered in the same burst so the popup can highlight
     // only the latest fetch group. New URLs within the gap share a batch.
@@ -279,7 +303,8 @@ async function remember(tabId, url, extra, frameId) {
     map[playUrl].userAgent === next.userAgent &&
     map[playUrl].cookie === next.cookie &&
     map[playUrl].cookieHost === next.cookieHost &&
-    map[playUrl].frame === next.frame
+    map[playUrl].frame === next.frame &&
+    map[playUrl].title === next.title
   ) {
     return;
   }

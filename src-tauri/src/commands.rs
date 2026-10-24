@@ -72,6 +72,11 @@ pub struct StreamSession {
     pid: Option<u32>,
     status: String,
     proxy: Option<ProxyHandle>,
+    /// Local proxy URL VLC opened (`<title>.m3u8` / `<title>.mp4`).
+    play_url: String,
+    /// Container page title from the extension, when provided. Names the
+    /// local proxy file VLC displays.
+    title: Option<String>,
     /// Staged subtitle files VLC reads by local path. Dropped when the
     /// session ends so temp dirs are cleaned up after VLC exits.
     staged_subs: Vec<std::path::PathBuf>,
@@ -85,6 +90,21 @@ pub struct StreamDto {
     pub host: String,
     pub quality: String,
     pub status: String,
+    pub title: Option<String>,
+    /// Local proxy URL VLC opened.
+    pub local_url: String,
+    /// Loopback port VLC connects to.
+    pub port: Option<u16>,
+    /// Upstream fetch state: `downloading` | `buffered` | `error` | `idle`.
+    pub fetch_status: String,
+    /// Trailing-10s download speed in bytes/sec, when recently active.
+    pub speed_bps: Option<u64>,
+    /// Cumulative upstream bytes fetched for this session.
+    pub fetched_bytes: u64,
+    /// Latest upstream failure diagnosis, if the last result was an error.
+    pub last_error: Option<String>,
+    /// Sorted indexes of segments currently held in cache.
+    pub cached: Vec<usize>,
     pub pid: Option<u32>,
     /// Last segment index VLC requested (playhead). Seeks move it.
     pub playhead: Option<usize>,
@@ -102,6 +122,7 @@ pub struct StreamDto {
 
 impl StreamSession {
     fn dto(&self) -> StreamDto {
+        let now = now_ms();
         let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
             match &self.proxy {
                 Some(p) => {
@@ -144,12 +165,47 @@ impl StreamSession {
                 }
                 None => (None, 0, Vec::new(), None, 0, 0, 0, 0),
             };
+        let (port, fetch_status, speed_bps, fetched_bytes, last_error, cached) =
+            match &self.proxy {
+                Some(p) => {
+                    let st = p.state.lock().unwrap();
+                    let status = crate::proxy::fetch_status(
+                        total,
+                        buffered,
+                        window_len,
+                        st.fetch_inflight,
+                        st.last_ok_ms,
+                        st.last_error_ms,
+                        now,
+                    );
+                    let mut cached: Vec<usize> =
+                        st.seg_cache.keys().copied().collect();
+                    cached.sort_unstable();
+                    (
+                        p.port(),
+                        status.to_string(),
+                        crate::proxy::recent_speed_bps(&st.recent, now),
+                        st.fetched_bytes,
+                        st.last_error.clone(),
+                        cached,
+                    )
+                }
+                None => (None, "idle".to_string(), None, 0, None, Vec::new()),
+            };
         StreamDto {
             id: self.id,
             url: self.url.clone(),
             host: host_of(&self.url),
             quality: self.quality.clone(),
             status: self.status.clone(),
+            title: self.title.clone(),
+            local_url: self.play_url.clone(),
+            port,
+            fetch_status,
+            speed_bps,
+            fetched_bytes,
+            last_error,
+            cached,
             pid: self.pid,
             playhead,
             buffered,
@@ -272,10 +328,15 @@ pub fn ingest_capture(app: &AppHandle, capture: ParsedCurl) {
         .as_ref()
         .map(|s| format!(" subs={}", s.len()))
         .unwrap_or_default();
+    let title = capture
+        .title
+        .as_deref()
+        .map(|t| format!(" title={t:?}"))
+        .unwrap_or_default();
     log(
         app,
         "info",
-        format!("capture {}{extra}{cookie}{subs}", capture.url),
+        format!("capture {}{extra}{cookie}{subs}{title}", capture.url),
     );
     let _ = app.emit("play-open", &capture);
     if let Some(w) = app.get_webview_window("main") {
@@ -723,6 +784,7 @@ pub async fn play_cmd(
     subtitles: Option<Vec<String>>,
     subtitle: Option<String>,
     prefetch_count: Option<usize>,
+    title: Option<String>,
 ) -> Result<ResolveResponse, String> {
     let app2 = app.clone();
     let dir = workdir(&app, &state);
@@ -741,6 +803,7 @@ pub async fn play_cmd(
             subtitles,
             subtitle,
             prefetch_count,
+            title,
         )
     })
     .await
@@ -825,6 +888,7 @@ fn play_blocking(
     subtitles: Option<Vec<String>>,
     subtitle: Option<String>,
     prefetch_count: Option<usize>,
+    title: Option<String>,
 ) -> Result<ResolveResponse, String> {
     let extra = extra.unwrap_or(false);
     let prefetch_count = prefetch_count.unwrap_or(3).min(20);
@@ -852,9 +916,13 @@ fn play_blocking(
         app,
         "info",
         format!(
-            "play {} {url} quality={q}{}  Referer={}  Origin={}{}",
+            "play {} {url} quality={q}{}{}  Referer={}  Origin={}{}",
             kind.as_str(),
             if extra { " (another instance)" } else { "" },
+            title
+                .as_deref()
+                .map(|t| format!(" title={t:?}"))
+                .unwrap_or_default(),
             headers.get("Referer").cloned().unwrap_or_default(),
             headers.get("Origin").cloned().unwrap_or_default(),
             if headers.contains_key("Cookie") {
@@ -879,6 +947,7 @@ fn play_blocking(
                 false,
                 &extra_subs,
                 Some(&mut on_stage),
+                title.as_deref(),
             )
             .map_err(|e| {
                 log(app, "error", e.to_string());
@@ -901,6 +970,8 @@ fn play_blocking(
                 url,
                 q,
                 staged,
+                title.clone(),
+                local,
             );
             Ok(ResolveResponse::Ok {
                 kind: kind.as_str().into(),
@@ -930,6 +1001,7 @@ fn play_blocking(
                 None,
                 Some(&mut on_stage),
                 prefetch_count,
+                title.as_deref(),
             ) {
                 Ok(pb) => {
                     let referer = headers.get("Referer").cloned().unwrap_or_default();
@@ -951,6 +1023,8 @@ fn play_blocking(
                         url,
                         q,
                         staged,
+                        title.clone(),
+                        local,
                     );
                     Ok(ResolveResponse::Ok {
                         kind: "hls".into(),
@@ -976,6 +1050,7 @@ fn play_blocking(
                         false,
                         &extra_subs,
                         Some(&mut on_stage),
+                        title.as_deref(),
                     )
                     .map_err(|e| {
                         log(app, "error", e.to_string());
@@ -995,6 +1070,8 @@ fn play_blocking(
                         url,
                         q,
                         staged,
+                        title.clone(),
+                        local,
                     );
                     Ok(ResolveResponse::Ok {
                         kind: "http".into(),
@@ -1033,6 +1110,8 @@ fn spawn_session(
     url: &str,
     quality: &str,
     staged_subs: Vec<std::path::PathBuf>,
+    title: Option<String>,
+    play_url: String,
 ) {
     let pid = child.id();
     if extra {
@@ -1056,6 +1135,8 @@ fn spawn_session(
             pid: Some(pid),
             status: "playing".into(),
             proxy,
+            title: title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            play_url,
             staged_subs,
         },
     );

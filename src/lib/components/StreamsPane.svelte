@@ -117,7 +117,7 @@
               <div class="flex items-start gap-2">
                 <div class="min-w-0 flex-1">
                   <p class="truncate font-mono text-xs text-surface-100" title={s.url}>
-                    {base(s.url)}
+                    {s.title?.trim() || base(s.url)}
                   </p>
                   <p class="mt-0.5 truncate text-[11px] text-surface-500">
                     {s.quality}
