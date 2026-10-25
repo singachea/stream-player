@@ -124,6 +124,10 @@ export function listStreams(): Promise<StreamSession[]> {
   return invoke("list_streams_cmd");
 }
 
+export function seekStream(id: number, seg: number): Promise<StreamSession> {
+  return invoke("seek_stream_cmd", { id, seg });
+}
+
 export function stopStream(id: number): Promise<void> {
   return invoke("stop_stream_cmd", { id });
 }

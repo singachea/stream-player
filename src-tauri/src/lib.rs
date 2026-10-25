@@ -19,6 +19,7 @@ pub fn run() {
         .manage(commands::AppState::new())
         .setup(|app| {
             capture::start(app.handle().clone());
+            commands::spawn_wedge_watchdog(app.handle());
             let handle = app.handle().clone();
             use tauri_plugin_deep_link::DeepLinkExt;
             app.deep_link().on_open_url(move |event| {
@@ -44,6 +45,7 @@ pub fn run() {
             commands::list_streams_cmd,
             commands::stop_stream_cmd,
             commands::stream_stats_cmd,
+            commands::seek_stream_cmd,
             commands::download_cmd,
             commands::list_jobs_cmd,
             commands::cancel_job_cmd,

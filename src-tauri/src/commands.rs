@@ -1,9 +1,12 @@
+use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{MutexGuard, TryLockError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,13 +21,14 @@ use crate::hls::{
     parse_subtitle_tracks, parse_variants, ranked_variants, subtitle_label, variant_label, Variant,
 };
 use crate::player::{
-    start_hls_playback, start_http_playback, vlc_path, vlc_stderr_level, wait_for_vlc,
+    rc_seek, spawn_vlc, start_hls_playback, start_http_playback, vlc_path, vlc_stderr_level,
+    wait_for_vlc,
 };
 use crate::prefs::{
     host_of, load_prefs, normalize_referer, prefs_path, remember_prefs, save_prefs, settings_for,
     Prefs,
 };
-use crate::proxy::ProxyHandle;
+use crate::proxy::{port_of, ProxyHandle, ProxyState};
 use crate::urls::{
     auto_filename, detect_kind, origin_of, parse_curl, strip_proto, Kind, ParsedCurl, UA_DEFAULT,
 };
@@ -44,7 +48,7 @@ pub struct AppState {
     pub jobs: Mutex<BTreeMap<u64, Job>>,
     pub job_seq: AtomicU64,
     pub pending_capture: Mutex<Option<ParsedCurl>>,
-    pub streams: Mutex<BTreeMap<u64, StreamSession>>,
+    pub streams: TrackedMutex<BTreeMap<u64, StreamSession>>,
     pub stream_seq: AtomicU64,
 }
 
@@ -58,13 +62,15 @@ impl AppState {
             jobs: Mutex::new(BTreeMap::new()),
             job_seq: AtomicU64::new(1),
             pending_capture: Mutex::new(None),
-            streams: Mutex::new(BTreeMap::new()),
+            streams: TrackedMutex::new(BTreeMap::new()),
             stream_seq: AtomicU64::new(1),
         }
     }
 }
 
-/// One playing stream: VLC process plus its proxy cache.
+/// One playing stream: VLC process plus its proxy cache. Snapshots
+/// (`StreamSnap`) carry facts out from under the streams guard; the handle
+/// itself is never cloned (dropping a handle clone stops its dispatch loop).
 pub struct StreamSession {
     id: u64,
     url: String,
@@ -74,6 +80,10 @@ pub struct StreamSession {
     proxy: Option<ProxyHandle>,
     /// Local proxy URL VLC opened (`<title>.m3u8` / `<title>.mp4`).
     play_url: String,
+    /// VLC subtitle args from launch, reused by seek relaunches.
+    sub_args: Vec<String>,
+    /// Remote-control port of this session's VLC, if allocated.
+    rc_port: Option<u16>,
     /// Container page title from the extension, when provided. Names the
     /// local proxy file VLC displays.
     title: Option<String>,
@@ -120,102 +130,135 @@ pub struct StreamDto {
     pub served: u64,
 }
 
+/// Owned session facts safe to carry past the streams guard: proxy state by
+/// Arc and base URL by value, never the handle itself.
+#[derive(Clone)]
+struct StreamSnap {
+    id: u64,
+    url: String,
+    quality: String,
+    status: String,
+    title: Option<String>,
+    play_url: String,
+    pid: Option<u32>,
+    proxy_state: Option<Arc<Mutex<ProxyState>>>,
+    proxy_base: Option<String>,
+}
+
 impl StreamSession {
-    fn dto(&self) -> StreamDto {
-        let now = now_ms();
-        let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
-            match &self.proxy {
-                Some(p) => {
-                    let st = p.state.lock().unwrap();
-                    let total = st.segments.len();
-                    let playhead = st.served_cur;
-                    // Contiguous cached run ahead of the playhead. Sparse
-                    // entries past a gap do not count: VLC cannot play them yet.
-                    let start = playhead.map_or(0, |h| h + 1);
-                    let mut buffered = 0;
-                    for n in start..total {
-                        if st.seg_cache.contains_key(&n) {
-                            buffered += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    // Next 10% window after the playhead, sampled into 20
-                    // pieces (0.5% each). A piece is filled when any segment
-                    // in its slice is cached. Gaps stay visible until the
-                    // fetcher fills them in order.
-                    let want = crate::proxy::readahead_window(total, start);
-                    let window_start = (want > 0).then_some(start);
-                    let mut window = Vec::new();
-                    for i in 0..20 {
-                        let lo = start + (want * i) / 20;
-                        let hi = start + (want * (i + 1)) / 20;
-                        window.push(lo < hi && (lo..hi).any(|n| st.seg_cache.contains_key(&n)));
-                    }
-                    (
-                        playhead,
-                        buffered,
-                        window,
-                        window_start,
-                        want,
-                        total,
-                        st.cached_bytes,
-                        st.served_count,
-                    )
-                }
-                None => (None, 0, Vec::new(), None, 0, 0, 0, 0),
-            };
-        let (port, fetch_status, speed_bps, fetched_bytes, last_error, cached) =
-            match &self.proxy {
-                Some(p) => {
-                    let st = p.state.lock().unwrap();
-                    let status = crate::proxy::fetch_status(
-                        total,
-                        buffered,
-                        window_len,
-                        st.fetch_inflight,
-                        st.last_ok_ms,
-                        st.last_error_ms,
-                        now,
-                    );
-                    let mut cached: Vec<usize> =
-                        st.seg_cache.keys().copied().collect();
-                    cached.sort_unstable();
-                    (
-                        p.port(),
-                        status.to_string(),
-                        crate::proxy::recent_speed_bps(&st.recent, now),
-                        st.fetched_bytes,
-                        st.last_error.clone(),
-                        cached,
-                    )
-                }
-                None => (None, "idle".to_string(), None, 0, None, Vec::new()),
-            };
-        StreamDto {
+    fn snapshot(&self) -> StreamSnap {
+        let (proxy_state, proxy_base) = match &self.proxy {
+            Some(p) => (Some(p.state.clone()), Some(p.base.clone())),
+            None => (None, None),
+        };
+        StreamSnap {
             id: self.id,
             url: self.url.clone(),
-            host: host_of(&self.url),
             quality: self.quality.clone(),
             status: self.status.clone(),
             title: self.title.clone(),
-            local_url: self.play_url.clone(),
-            port,
-            fetch_status,
-            speed_bps,
-            fetched_bytes,
-            last_error,
-            cached,
+            play_url: self.play_url.clone(),
             pid: self.pid,
-            playhead,
-            buffered,
-            window,
-            window_start,
-            window_len,
-            total,
-            cached_bytes,
-            served,
+            proxy_state,
+            proxy_base,
         }
+    }
+}
+
+fn dto_from_snap(snap: &StreamSnap) -> StreamDto {
+    let now = now_ms();
+    let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
+        match &snap.proxy_state {
+            Some(state) => {
+                let st = state.lock().unwrap();
+                let total = st.segments.len();
+                let playhead = st.served_cur;
+                // Contiguous cached run ahead of the playhead. Sparse
+                // entries past a gap do not count: VLC cannot play them yet.
+                let start = playhead.map_or(0, |h| h + 1);
+                let mut buffered = 0;
+                for n in start..total {
+                    if st.seg_cache.contains_key(&n) {
+                        buffered += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Next 10% window after the playhead, sampled into 20
+                // pieces (0.5% each). A piece is filled when any segment
+                // in its slice is cached. Gaps stay visible until the
+                // fetcher fills them in order.
+                let want = crate::proxy::readahead_window(total, start);
+                let window_start = (want > 0).then_some(start);
+                let mut window = Vec::new();
+                for i in 0..20 {
+                    let lo = start + (want * i) / 20;
+                    let hi = start + (want * (i + 1)) / 20;
+                    window.push(lo < hi && (lo..hi).any(|n| st.seg_cache.contains_key(&n)));
+                }
+                (
+                    playhead,
+                    buffered,
+                    window,
+                    window_start,
+                    want,
+                    total,
+                    st.cached_bytes,
+                    st.served_count,
+                )
+            }
+            None => (None, 0, Vec::new(), None, 0, 0, 0, 0),
+        };
+    let (port, fetch_status, speed_bps, fetched_bytes, last_error, cached) =
+        match &snap.proxy_state {
+            Some(state) => {
+                let st = state.lock().unwrap();
+                let status = crate::proxy::fetch_status(
+                    total,
+                    buffered,
+                    window_len,
+                    st.fetch_inflight,
+                    st.last_ok_ms,
+                    st.last_error_ms,
+                    now,
+                );
+                let mut cached: Vec<usize> =
+                    st.seg_cache.keys().copied().collect();
+                cached.sort_unstable();
+                (
+                    snap.proxy_base.as_deref().and_then(port_of),
+                    status.to_string(),
+                    crate::proxy::recent_speed_bps(&st.recent, now),
+                    st.fetched_bytes,
+                    st.last_error.clone(),
+                    cached,
+                )
+            }
+            None => (None, "idle".to_string(), None, 0, None, Vec::new()),
+        };
+    StreamDto {
+        id: snap.id,
+        url: snap.url.clone(),
+        host: host_of(&snap.url),
+        quality: snap.quality.clone(),
+        status: snap.status.clone(),
+        title: snap.title.clone(),
+        local_url: snap.play_url.clone(),
+        port,
+        fetch_status,
+        speed_bps,
+        fetched_bytes,
+        last_error,
+        cached,
+        pid: snap.pid,
+        playhead,
+        buffered,
+        window,
+        window_start,
+        window_len,
+        total,
+        cached_bytes,
+        served,
     }
 }
 
@@ -223,12 +266,229 @@ fn emit_stream(app: &AppHandle, dto: &StreamDto) {
     let _ = app.emit("stream-updated", dto);
 }
 
+/// Call sites that take the streams lock, so a stuck holder can be named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamsSite {
+    List,
+    Patch,
+    SpawnInsert,
+    SpawnLog,
+    Reap,
+    Stop,
+    SeekSnapshot,
+    SeekUpdate,
+    SeekLog,
+}
+
+impl StreamsSite {
+    const FREE: u8 = u8::MAX;
+
+    fn id(self) -> u8 {
+        self as u8
+    }
+
+    fn name(id: u8) -> &'static str {
+        match id {
+            x if x == Self::List as u8 => "List",
+            x if x == Self::Patch as u8 => "Patch",
+            x if x == Self::SpawnInsert as u8 => "SpawnInsert",
+            x if x == Self::SpawnLog as u8 => "SpawnLog",
+            x if x == Self::Reap as u8 => "Reap",
+            x if x == Self::Stop as u8 => "Stop",
+            x if x == Self::SeekSnapshot as u8 => "SeekSnapshot",
+            x if x == Self::SeekUpdate as u8 => "SeekUpdate",
+            x if x == Self::SeekLog as u8 => "SeekLog",
+            _ => "unknown",
+        }
+    }
+}
+
+/// A Mutex that records who holds it. The UI thread must never wedge on a
+/// backend lock again: main-thread commands use `try_lock` and back off,
+/// while `lock` reports the recorded holder when it has to wait, so a
+/// stuck holder names itself instead of freezing the app silently.
+struct TrackedMutex<T> {
+    inner: Mutex<T>,
+    site: AtomicU8,
+    since_ms: AtomicU64,
+    /// Owning stack of the current holder, captured at acquire time so a
+    /// stuck holder names its own call path even if its thread is gone.
+    trace: Mutex<String>,
+    waiters: AtomicU64,
+}
+
+struct TrackedGuard<'a, T> {
+    guard: MutexGuard<'a, T>,
+    meta: &'a TrackedMutex<T>,
+}
+
+impl<T> Deref for TrackedGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for TrackedGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for TrackedGuard<'_, T> {
+    fn drop(&mut self) {
+        self.meta.site.store(StreamsSite::FREE, Ordering::SeqCst);
+    }
+}
+
+impl<T> TrackedMutex<T> {
+    fn new(v: T) -> Self {
+        Self {
+            inner: Mutex::new(v),
+            site: AtomicU8::new(StreamsSite::FREE),
+            since_ms: AtomicU64::new(0),
+            trace: Mutex::new(String::new()),
+            waiters: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, site: StreamsSite) {
+        self.since_ms.store(now_ms(), Ordering::SeqCst);
+        self.site.store(site.id(), Ordering::SeqCst);
+        // Short private section, always taken streams-then-trace and read
+        // alone in `holder_trace`, so it cannot join a lock cycle.
+        // A poisoned trace is skipped, never fatal.
+        if let Ok(mut t) = self.trace.lock() {
+            *t = format!("{:?}", Backtrace::force_capture());
+        }
+    }
+
+    /// Who claims to hold the lock, if anyone, with hold time in ms.
+    pub(crate) fn holder(&self) -> Option<(&'static str, u64)> {
+        let id = self.site.load(Ordering::SeqCst);
+        if id == StreamsSite::FREE {
+            return None;
+        }
+        let age = now_ms().saturating_sub(self.since_ms.load(Ordering::SeqCst));
+        Some((StreamsSite::name(id), age))
+    }
+
+    pub(crate) fn holder_report(&self) -> String {
+        match self.holder() {
+            Some((site, age)) => format!("held by {site} for {age}ms"),
+            None => "holder unknown (already released)".into(),
+        }
+    }
+
+    pub(crate) fn holder_trace(&self) -> String {
+        self.trace.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn waiter_count(&self) -> u64 {
+        self.waiters.load(Ordering::SeqCst)
+    }
+
+    fn wrap<'a>(&'a self, guard: MutexGuard<'a, T>, site: StreamsSite) -> TrackedGuard<'a, T> {
+        self.record(site);
+        TrackedGuard { guard, meta: self }
+    }
+
+    /// Blocking acquire with progress reports: never waits silently.
+    fn lock(&self, site: StreamsSite) -> TrackedGuard<'_, T> {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let start = Instant::now();
+        let mut next_report = start + Duration::from_secs(2);
+        loop {
+            match self.inner.try_lock() {
+                Ok(guard) => {
+                    self.waiters.fetch_sub(1, Ordering::SeqCst);
+                    return self.wrap(guard, site);
+                }
+                Err(TryLockError::Poisoned(e)) => {
+                    // A panicked holder already dropped its guard: recover
+                    // instead of wedging every future caller on its behalf.
+                    self.waiters.fetch_sub(1, Ordering::SeqCst);
+                    return self.wrap(e.into_inner(), site);
+                }
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= next_report {
+                let msg = format!(
+                    "play: streams lock waited {}ms ({})",
+                    start.elapsed().as_millis(),
+                    self.holder_report()
+                );
+                eprintln!("{msg}");
+                wedge_log(&msg);
+                next_report = Instant::now() + Duration::from_secs(5);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Non-blocking acquire for main-thread commands: back off instead of
+    /// beachballing when a worker is mid-update.
+    fn try_lock(&self, site: StreamsSite) -> Option<TrackedGuard<'_, T>> {
+        match self.inner.try_lock() {
+            Ok(guard) => Some(self.wrap(guard, site)),
+            Err(TryLockError::Poisoned(e)) => Some(self.wrap(e.into_inner(), site)),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+/// File holding wedge diagnostics; readable without the dev terminal.
+pub(crate) fn wedge_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("play-wedge.log")
+}
+
+/// Append one wedge line, restarting the file past 512 KiB. Never panics,
+/// never blocks on backend locks: diagnostics must not join a wedge.
+pub(crate) fn wedge_log(msg: &str) {
+    let path = wedge_path();
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 512 * 1024 {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{} {msg}", now_ms());
+    }
+}
+
+/// Background watchdog: while the streams map stays held, record the
+/// holder's own acquire-time stack to the wedge file every 5 s.
+pub(crate) fn spawn_wedge_watchdog(app: &AppHandle) {
+    eprintln!("play: wedge log at {}", wedge_path().display());
+    let app = app.clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(5));
+        let st = app.state::<AppState>();
+        if st.streams.holder().is_some_and(|(_, age)| age > 15_000) {
+            wedge_log(&format!(
+                "WEDGE streams {} waiters={} trace:\n{}",
+                st.streams.holder_report(),
+                st.streams.waiter_count(),
+                st.streams.holder_trace()
+            ));
+        }
+    });
+}
+
 fn patch_stream(app: &AppHandle, id: u64, f: impl FnOnce(&mut StreamSession)) -> Option<StreamDto> {
     let st = app.state::<AppState>();
-    let mut streams = st.streams.lock().unwrap();
-    let s = streams.get_mut(&id)?;
-    f(s);
-    Some(s.dto())
+    // Brief map-only section: clone under the guard, build the DTO after it
+    // drops, so a slow proxy can never wedge the streams map through here.
+    let snap = {
+        let mut streams = st.streams.lock(StreamsSite::Patch);
+        let s = streams.get_mut(&id)?;
+        f(s);
+        s.snapshot()
+    };
+    Some(dto_from_snap(&snap))
 }
 
 #[derive(Clone, Serialize)]
@@ -365,6 +625,64 @@ fn emit_log(app: &AppHandle, level: &str, source: &str, id: Option<u64>, msg: im
             id,
         },
     );
+}
+
+/// Flood gate for machine-generated log lines (VLC stderr). VLC repeats
+/// the same decoder error hundreds of times per second when it struggles
+/// — notably right after a seek into an uncached region — and every line
+/// would otherwise become its own UI event, freezing the log view.
+/// At most BUDGET lines pass per WINDOW; the rest are counted and reported
+/// as a single notice.
+#[derive(Debug)]
+struct LogGate {
+    window_start: Instant,
+    allowed: u32,
+    suppressed: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GateAction {
+    Emit,
+    EmitWithNotice(u32),
+    Suppress,
+}
+
+impl LogGate {
+    const BUDGET: u32 = 20;
+    const WINDOW: Duration = Duration::from_secs(1);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            allowed: 0,
+            suppressed: 0,
+        }
+    }
+
+    fn check(&mut self, now: Instant) -> GateAction {
+        if now.duration_since(self.window_start) >= Self::WINDOW {
+            let n = self.suppressed;
+            self.window_start = now;
+            self.allowed = 0;
+            self.suppressed = 0;
+            if n > 0 {
+                // The boundary line still counts against the new window.
+                self.allowed = 1;
+                return GateAction::EmitWithNotice(n);
+            }
+        }
+        if self.allowed < Self::BUDGET {
+            self.allowed += 1;
+            GateAction::Emit
+        } else {
+            self.suppressed += 1;
+            GateAction::Suppress
+        }
+    }
+
+    fn suppressed(&self) -> u32 {
+        self.suppressed
+    }
 }
 
 fn kill_pid(pid: u32) {
@@ -972,6 +1290,8 @@ fn play_blocking(
                 staged,
                 title.clone(),
                 local,
+                pb.sub_args,
+                pb.rc_port,
             );
             Ok(ResolveResponse::Ok {
                 kind: kind.as_str().into(),
@@ -1025,6 +1345,8 @@ fn play_blocking(
                         staged,
                         title.clone(),
                         local,
+                        pb.sub_args,
+                        pb.rc_port,
                     );
                     Ok(ResolveResponse::Ok {
                         kind: "hls".into(),
@@ -1072,6 +1394,8 @@ fn play_blocking(
                         staged,
                         title.clone(),
                         local,
+                        pb.sub_args,
+                        pb.rc_port,
                     );
                     Ok(ResolveResponse::Ok {
                         kind: "http".into(),
@@ -1104,7 +1428,7 @@ fn remove_staged_subs(paths: Vec<std::path::PathBuf>) {
 fn spawn_session(
     app: &AppHandle,
     state: &AppState,
-    mut child: Child,
+    child: Child,
     proxy: Option<ProxyHandle>,
     extra: bool,
     url: &str,
@@ -1112,6 +1436,8 @@ fn spawn_session(
     staged_subs: Vec<std::path::PathBuf>,
     title: Option<String>,
     play_url: String,
+    sub_args: Vec<String>,
+    rc_port: Option<u16>,
 ) {
     let pid = child.id();
     if extra {
@@ -1126,7 +1452,7 @@ fn spawn_session(
         kill_pid(old);
     }
     let stream_id = state.stream_seq.fetch_add(1, Ordering::SeqCst);
-    state.streams.lock().unwrap().insert(
+    state.streams.lock(StreamsSite::SpawnInsert).insert(
         stream_id,
         StreamSession {
             id: stream_id,
@@ -1137,26 +1463,36 @@ fn spawn_session(
             proxy,
             title: title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
             play_url,
+            sub_args,
+            rc_port,
             staged_subs,
         },
     );
     if let Some(dto) = patch_stream(app, stream_id, |_| {}) {
         emit_stream(app, &dto);
     }
-    if let Some(s) = state.streams.lock().unwrap().get_mut(&stream_id) {
-        if let Some(ref proxy) = s.proxy {
-            let app_log = app.clone();
-            let cb: Arc<dyn Fn(&str, String) + Send + Sync> = Arc::new(move |level, msg| {
-                log_vlc(&app_log, level, pid, msg);
-            });
-            let pending = {
-                let mut st = proxy.state.lock().unwrap();
-                st.on_log = Some(cb.clone());
-                std::mem::take(&mut st.pending_log)
-            };
-            for (level, msg) in pending {
-                cb(&level, msg);
-            }
+    // Snapshot the proxy first: the pending-log flush emits to the UI and
+    // must never run under the streams guard.
+    // Snapshot proxy state by Arc: cloning the handle would stop its
+    // dispatch loop when the clone drops.
+    let proxy_state = {
+        let streams = state.streams.lock(StreamsSite::SpawnLog);
+        streams
+            .get(&stream_id)
+            .and_then(|s| s.proxy.as_ref().map(|p| p.state.clone()))
+    };
+    if let Some(ref proxy_state) = proxy_state {
+        let app_log = app.clone();
+        let cb: Arc<dyn Fn(&str, String) + Send + Sync> = Arc::new(move |level, msg| {
+            log_vlc(&app_log, level, pid, msg);
+        });
+        let pending = {
+            let mut st = proxy_state.lock().unwrap();
+            st.on_log = Some(cb.clone());
+            std::mem::take(&mut st.pending_log)
+        };
+        for (level, msg) in pending {
+            cb(&level, msg);
         }
     }
     log_vlc(
@@ -1168,22 +1504,53 @@ fn spawn_session(
             if extra { " extra instance" } else { "" }
         ),
     );
+    watch_child(app.clone(), stream_id, pid, child);
+}
+
+/// Drain one VLC child's stderr into the log, then reap it. When a seek
+/// replaced the session pid first, the old child's exit tears nothing down.
+fn watch_child(app: AppHandle, stream_id: u64, pid: u32, mut child: Child) {
     if let Some(stderr) = child.stderr.take() {
         let app_err = app.clone();
         thread::spawn(move || {
+            let mut gate = LogGate::new(Instant::now());
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
-                if let Some(level) = vlc_stderr_level(&line) {
-                    log_vlc(&app_err, level, pid, line);
+                let Some(level) = vlc_stderr_level(&line) else {
+                    continue;
+                };
+                match gate.check(Instant::now()) {
+                    GateAction::Emit => log_vlc(&app_err, level, pid, line),
+                    GateAction::EmitWithNotice(n) => {
+                        log_vlc(
+                            &app_err,
+                            "warn",
+                            pid,
+                            format!("…{n} repeated VLC lines suppressed"),
+                        );
+                        log_vlc(&app_err, level, pid, line);
+                    }
+                    GateAction::Suppress => {}
                 }
+            }
+            if gate.suppressed() > 0 {
+                log_vlc(
+                    &app_err,
+                    "warn",
+                    pid,
+                    format!("…{} repeated VLC lines suppressed", gate.suppressed()),
+                );
             }
         });
     }
-    let app = app.clone();
     thread::spawn(move || {
         let code = wait_for_vlc(&mut child, false);
         let _ = child.kill();
         let st = app.state::<AppState>();
+        if st.streams.lock(StreamsSite::Reap).get(&stream_id).and_then(|s| s.pid) != Some(pid) {
+            // Superseded by a seek relaunch: the session lives on.
+            return;
+        }
         {
             let mut primary = st.primary.lock().unwrap();
             if *primary == Some(pid) {
@@ -1191,7 +1558,7 @@ fn spawn_session(
             }
         }
         st.extras.lock().unwrap().retain(|p| *p != pid);
-        let removed = st.streams.lock().unwrap().remove(&stream_id);
+        let removed = st.streams.lock(StreamsSite::Reap).remove(&stream_id);
         if let Some(s) = removed {
             // Temp subtitle dirs die with the session so VLC can read them
             // for the whole playback and nothing lingers after.
@@ -1213,23 +1580,32 @@ pub fn stop_cmd(app: AppHandle, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn list_streams_cmd(state: State<AppState>) -> Vec<StreamDto> {
-    state
-        .streams
-        .lock()
-        .unwrap()
-        .values()
-        .map(|s| s.dto())
-        .collect()
+pub fn list_streams_cmd(state: State<AppState>) -> Result<Vec<StreamDto>, String> {
+    // try_lock: this runs on the UI thread (poll + mount), so back off
+    // instead of beachballing when a worker is mid-update.
+    // Brief map-only section: snapshot sessions, assemble DTOs (which take
+    // the proxy lock) after the guard drops. Never nests locks.
+    let snaps: Vec<StreamSnap> = {
+        let streams = state.streams.try_lock(StreamsSite::List).ok_or_else(|| {
+            format!(
+                "play: streams busy ({}), retrying",
+                state.streams.holder_report()
+            )
+        })?;
+        streams.values().map(|s| s.snapshot()).collect()
+    };
+    Ok(snaps.iter().map(dto_from_snap).collect())
 }
 
 #[tauri::command]
 pub fn stop_stream_cmd(app: AppHandle, id: u64) -> Result<(), String> {
-    let removed = app
-        .state::<AppState>()
+    // try_lock: UI-thread command; back off with a retryable error instead
+    // of wedging when a worker is mid-update.
+    let st = app.state::<AppState>();
+    let removed = st
         .streams
-        .lock()
-        .unwrap()
+        .try_lock(StreamsSite::Stop)
+        .ok_or_else(|| format!("play: streams busy ({}), retry", st.streams.holder_report()))?
         .remove(&id);
     let Some(s) = removed else {
         return Err(format!("play: no stream {id}"));
@@ -1238,7 +1614,6 @@ pub fn stop_stream_cmd(app: AppHandle, id: u64) -> Result<(), String> {
         log_vlc(&app, "info", pid, format!("stop stream {id} pid={pid}"));
         kill_pid(pid);
     }
-    let st = app.state::<AppState>();
     {
         let mut primary = st.primary.lock().unwrap();
         if *primary == s.pid {
@@ -1254,8 +1629,137 @@ pub fn stop_stream_cmd(app: AppHandle, id: u64) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn stream_stats_cmd(state: State<AppState>) -> Vec<StreamDto> {
+pub fn stream_stats_cmd(state: State<AppState>) -> Result<Vec<StreamDto>, String> {
     list_streams_cmd(state)
+}
+
+/// Jump VLC to segment `seg` without interrupting playback: an absolute
+/// `seek` on the instance's remote-control channel, positioned from the
+/// summed `#EXTINF` durations before the segment. When the control channel
+/// is unavailable, falls back to relaunching VLC on the same local URL
+/// with `?from=seg` (the proxy serves it trimmed). Either way the session
+/// and its cache survive.
+///
+/// Async with blocking work off the main thread: the control-channel
+/// retries alone can take seconds, which would beachball the UI as a sync
+/// command.
+#[tauri::command(async)]
+pub async fn seek_stream_cmd(app: AppHandle, id: u64, seg: usize) -> Result<StreamDto, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || seek_blocking(&app2, id, seg))
+        .await
+        .map_err(|e| format!("play: seek task failed: {e}"))?
+}
+
+fn seek_blocking(app: &AppHandle, id: u64, seg: usize) -> Result<StreamDto, String> {
+    let st = app.state::<AppState>();
+    // Flat snapshot: map fields first, proxy state after the guard drops.
+    // No streams section below touches the proxy lock anymore.
+    // Snapshot proxy state by Arc, never the handle: dropping a handle
+    // clone stops its dispatch loop.
+    let (play_url, sub_args, old_pid, rc_port, proxy_state) = {
+        let streams = st.streams.lock(StreamsSite::SeekSnapshot);
+        let s = streams
+            .get(&id)
+            .ok_or_else(|| format!("play: no stream {id}"))?;
+        (
+            s.play_url.clone(),
+            s.sub_args.clone(),
+            s.pid,
+            s.rc_port,
+            s.proxy.as_ref().map(|p| p.state.clone()),
+        )
+    };
+    let proxy_state = proxy_state
+        .as_ref()
+        .ok_or_else(|| format!("play: stream {id} has no proxy"))?;
+    let playlist = {
+        let pst = proxy_state.lock().unwrap();
+        if seg >= pst.segments.len() {
+            return Err(format!(
+                "play: segment {seg} out of range (total {})",
+                pst.segments.len()
+            ));
+        }
+        pst.playlist.clone()
+    };
+    if let Some(port) = rc_port {
+        let secs = crate::proxy::seg_offset_secs(&playlist, seg) as u64;
+        match rc_seek(port, secs) {
+            Ok(()) => {
+                // Stand down any stale fill window at once; the new window
+                // starts filling on the next serve. Show the target until
+                // serving confirms arrival. Proxy-only section (the map
+                // lookup updated nothing): no streams guard, so a slow
+                // proxy cannot wedge the map from the seek path.
+                {
+                    let mut pst = proxy_state.lock().unwrap();
+                    pst.fetch_epoch += 1;
+                    pst.served_cur = seg.checked_sub(1);
+                }
+                log_vlc(&app, "info", old_pid.unwrap_or(0), format!("seek stream {id} → seg {seg} ({secs}s)"));
+                let dto = patch_stream(&app, id, |_| {})
+                    .ok_or_else(|| format!("play: no stream {id}"))?;
+                emit_stream(&app, &dto);
+                return Ok(dto);
+            }
+            Err(e) => {
+                log_vlc(
+                    &app,
+                    "warn",
+                    old_pid.unwrap_or(0),
+                    format!("seek stream {id}: rc unavailable ({e}), relaunching"),
+                );
+            }
+        }
+    }
+    let sep = if play_url.contains('?') { '&' } else { '?' };
+    let target = format!("{play_url}{sep}from={seg}");
+    let mut args = sub_args;
+    args.push(target.clone());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // Spawn first: if VLC fails to launch, the old instance keeps playing.
+    let child = spawn_vlc(&vlc_path(), &arg_refs).map_err(err_str)?;
+    let pid = child.id();
+    log_vlc(&app, "info", pid, format!("seek stream {id} → seg {seg}"));
+    // Proxy first, map second: flat sections, never nested. Show the
+    // target immediately; serving updates it as VLC arrives.
+    {
+        proxy_state.lock().unwrap().served_cur = seg.checked_sub(1);
+    }
+    {
+        let mut streams = st.streams.lock(StreamsSite::SeekUpdate);
+        let s = streams
+            .get_mut(&id)
+            .ok_or_else(|| format!("play: no stream {id}"))?;
+        s.pid = Some(pid);
+    }
+    if let Some(old) = old_pid {
+        kill_pid(old);
+        {
+            let mut primary = st.primary.lock().unwrap();
+            if *primary == Some(old) {
+                *primary = Some(pid);
+            }
+        }
+        if let Some(slot) = st.extras.lock().unwrap().iter_mut().find(|p| **p == old) {
+            *slot = pid;
+        }
+    }
+    // Snapshot proxy was taken above: install the log hook with no streams
+    // section at all.
+    {
+        let app_log = app.clone();
+        let cb: Arc<dyn Fn(&str, String) + Send + Sync> = Arc::new(move |level, msg| {
+            log_vlc(&app_log, level, pid, msg);
+        });
+        proxy_state.lock().unwrap().on_log = Some(cb);
+    }
+    let dto = patch_stream(&app, id, |_| {})
+        .ok_or_else(|| format!("play: no stream {id}"))?;
+    emit_stream(&app, &dto);
+    watch_child(app.clone(), id, pid, child);
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -1661,4 +2165,117 @@ pub fn clear_jobs_cmd(app: AppHandle, state: State<AppState>) -> Vec<JobDto> {
 #[tauri::command]
 pub fn auto_filename_cmd(url: String) -> String {
     auto_filename(&url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_gate_passes_budget_then_suppresses() {
+        let t0 = Instant::now();
+        let mut gate = LogGate::new(t0);
+        for _ in 0..LogGate::BUDGET {
+            assert_eq!(gate.check(t0), GateAction::Emit);
+        }
+        assert_eq!(gate.check(t0), GateAction::Suppress);
+        assert_eq!(gate.suppressed(), 1);
+    }
+
+    #[test]
+    fn test_log_gate_rollover_reports_suppressed_once() {
+        let t0 = Instant::now();
+        let mut gate = LogGate::new(t0);
+        for _ in 0..LogGate::BUDGET {
+            gate.check(t0);
+        }
+        gate.check(t0);
+        gate.check(t0);
+        assert_eq!(gate.suppressed(), 2);
+        let later = t0 + LogGate::WINDOW;
+        assert_eq!(gate.check(later), GateAction::EmitWithNotice(2));
+        // New window starts clean: budget restored, count reset.
+        assert_eq!(gate.check(later), GateAction::Emit);
+        assert_eq!(gate.suppressed(), 0);
+    }
+
+    #[test]
+    fn test_log_gate_quiet_rollover_has_no_notice() {
+        let t0 = Instant::now();
+        let mut gate = LogGate::new(t0);
+        gate.check(t0);
+        assert_eq!(gate.check(t0 + LogGate::WINDOW), GateAction::Emit);
+    }
+
+    #[test]
+    fn test_tracked_mutex_records_and_clears_holder() {
+        let m = TrackedMutex::new(1u32);
+        assert_eq!(m.holder(), None);
+        {
+            let g = m.lock(StreamsSite::Patch);
+            assert_eq!(*g, 1);
+            let (site, _) = m.holder().expect("holder recorded");
+            assert_eq!(site, "Patch");
+        }
+        assert_eq!(m.holder(), None);
+    }
+
+    #[test]
+    fn test_tracked_mutex_try_lock_backs_off_and_names_holder() {
+        let m = TrackedMutex::new(1u32);
+        let _held = m.lock(StreamsSite::SpawnInsert);
+        // Same-thread try on a held non-recursive mutex must not block.
+        assert!(m.try_lock(StreamsSite::List).is_none());
+        let (site, _) = m.holder().expect("holder recorded");
+        assert_eq!(site, "SpawnInsert");
+    }
+
+    #[test]
+    fn test_tracked_mutex_recovers_poison() {
+        let m = TrackedMutex::new(1u32);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _g = m.lock(StreamsSite::Patch);
+                    panic!("boom");
+                });
+            });
+        }));
+        assert!(r.is_err());
+        let g = m.lock(StreamsSite::List);
+        assert_eq!(*g, 1);
+    }
+
+    #[test]
+    fn test_tracked_mutex_holder_visible_across_threads() {
+        let m = std::sync::Arc::new(TrackedMutex::new(1u32));
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|s| {
+            let (m2, entered2) = (m.clone(), entered.clone());
+            s.spawn(move || {
+                let _g = m2.lock(StreamsSite::Reap);
+                entered2.wait();
+                entered2.wait();
+            });
+            entered.wait();
+            let (site, _) = m.holder().expect("holder visible");
+            assert_eq!(site, "Reap");
+            entered.wait();
+        });
+    }
+
+    #[test]
+    fn test_tracked_mutex_records_holder_trace() {
+        let m = TrackedMutex::new(1u32);
+        assert!(m.holder_trace().is_empty());
+        assert_eq!(m.waiter_count(), 0);
+        {
+            let _g = m.lock(StreamsSite::SeekUpdate);
+            assert_eq!(m.holder().expect("holder").0, "SeekUpdate");
+            // The acquire-time stack must be captured: a stuck holder names
+            // its own call path in the wedge log even if its thread is gone.
+            assert!(!m.holder_trace().is_empty());
+        }
+        assert_eq!(m.holder(), None);
+    }
 }

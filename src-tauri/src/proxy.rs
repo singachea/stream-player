@@ -44,6 +44,11 @@ pub struct ProxyState {
     /// (epoch ms, bytes) of recent successful fetches, pruned to ~10s.
     /// Drives the download-speed readout; zero-byte marks are not stored.
     pub recent: VecDeque<(u64, u64)>,
+    /// Readahead generation. Each serving trigger bumps it and passes the
+    /// value to its fill thread; a thread whose epoch is stale (the user
+    /// sought to a new window) stops before its next segment, so only the
+    /// current seek position +10% is fetched.
+    pub fetch_epoch: u64,
     pub verbose: bool,
     pub source: Option<String>,
     pub on_log: Option<Arc<dyn Fn(&str, String) + Send + Sync>>,
@@ -59,6 +64,10 @@ pub struct ProxyHandle {
     pub base: String,
 }
 
+/// Shares state but NOT lifetime: dropping ANY clone (including this one)
+/// sets the shared stop flag and unblocks the dispatch loop. Only clone a
+/// handle for session-scoped ownership; short-lived snapshots must carry
+/// `state`/`base` instead, never the handle.
 impl Clone for ProxyHandle {
     fn clone(&self) -> Self {
         Self {
@@ -110,8 +119,13 @@ impl ProxyHandle {
 
     /// Loopback port VLC connects to, for the Diagnostics view.
     pub fn port(&self) -> Option<u16> {
-        self.base.rsplit(':').next()?.parse().ok()
+        port_of(&self.base)
     }
+}
+
+/// Loopback port parsed from a proxy base URL, without needing the handle.
+pub fn port_of(base: &str) -> Option<u16> {
+    base.rsplit(':').next()?.parse().ok()
 }
 
 fn now_ms() -> u64 {
@@ -171,6 +185,168 @@ pub(crate) fn recent_speed_bps(recent: &VecDeque<(u64, u64)>, now_ms: u64) -> Op
     }
     let span_ms = now_ms.saturating_sub(oldest).max(1);
     Some(bytes.saturating_mul(1000) / span_ms)
+}
+
+/// Numeric `from` query on a served playlist/master URL (`?from=N`),
+/// used by click-to-seek relaunches.
+pub(crate) fn query_from(url: &str) -> Option<usize> {
+    url.split_once('?')?.1.split('&').find_map(|p| {
+        p.split_once('=')
+            .filter(|(k, _)| *k == "from")
+            .and_then(|(_, v)| v.parse().ok())
+    })
+}
+
+/// `/seg/` slot number embedded in a rewritten media URI, if any.
+fn slot_of(uri: &str) -> Option<usize> {
+    uri.split("/seg/").nth(1)?.split('.').next()?.parse().ok()
+}
+
+/// Media time in seconds at the start of segment slot `slot`: the summed
+/// `#EXTINF` durations of earlier entries. Feeds absolute `seek` commands
+/// on the player's remote-control channel. Missing durations count as 0.
+pub(crate) fn seg_offset_secs(body: &[u8], slot: usize) -> f64 {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return 0.0;
+    };
+    let mut total = 0.0;
+    let mut pending = 0.0;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(v) = line.strip_prefix("#EXTINF:") {
+            pending = v.split(',').next().unwrap_or("").trim().parse().unwrap_or(0.0);
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if slot_of(line).is_some_and(|s| s < slot) {
+            total += pending;
+        }
+        pending = 0.0;
+    }
+    total
+}
+
+/// Serve the stored media playlist starting at segment slot `from`
+/// (click-to-seek): drop earlier segment entries and advance
+/// `#EXT-X-MEDIA-SEQUENCE` by the dropped count. KEY/MAP/EXTINF tags are
+/// carried onto the first kept segment. Returns None when `from` is past
+/// every segment, in which case the caller serves the full playlist.
+pub(crate) fn trim_playlist(body: &[u8], from: usize) -> Option<Vec<u8>> {
+    if from == 0 {
+        return Some(body.to_vec());
+    }
+    let text = std::str::from_utf8(body).ok()?;
+    // Pass 1: `from` is valid only when some media entry survives it.
+    // Unparseable URI lines count as kept (never silently dropped).
+    let mut media_count = 0usize;
+    let mut dropped = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        media_count += 1;
+        if slot_of(line).is_some_and(|s| s < from) {
+            dropped += 1;
+        }
+    }
+    if dropped >= media_count {
+        return None;
+    }
+    // Pass 2: rewrite.
+    let mut out: Vec<String> = Vec::new();
+    let mut key_stash: Option<String> = None;
+    let mut map_stash: Option<String> = None;
+    let mut extinf_stash: Option<String> = None;
+    let mut saw_seq = false;
+    let mut media_seen = 0usize;
+    let mut dropped_seen = 0usize;
+    let mut started = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            let orig: u64 = v.trim().parse().unwrap_or(0);
+            saw_seq = true;
+            out.push(format!("#EXT-X-MEDIA-SEQUENCE:{}", orig + dropped as u64));
+            continue;
+        }
+        if line.starts_with("#EXT-X-KEY") {
+            key_stash = Some(line.to_string());
+            continue;
+        }
+        if line.starts_with("#EXT-X-MAP") {
+            map_stash = Some(line.to_string());
+            continue;
+        }
+        if line.starts_with("#EXTINF") {
+            extinf_stash = Some(line.to_string());
+            continue;
+        }
+        if line.starts_with('#') {
+            // Header tags always stay; mid-playlist tags stay once every
+            // dropped entry has been passed.
+            if media_seen == 0 || dropped_seen >= dropped {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+        media_seen += 1;
+        if slot_of(line).is_some_and(|s| s < from) {
+            dropped_seen += 1;
+            extinf_stash = None;
+            continue;
+        }
+        if !started {
+            started = true;
+            if !saw_seq {
+                out.push(format!("#EXT-X-MEDIA-SEQUENCE:{dropped}"));
+            }
+            out.extend(key_stash.take());
+            out.extend(map_stash.take());
+        }
+        out.extend(extinf_stash.take());
+        out.push(line.to_string());
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    Some(s.into_bytes())
+}
+
+/// Point a stored master playlist's video URI at `?from=N` so a seek
+/// relaunch keeps its subtitle bundle. The subtitle (`/sub/`) URIs are
+/// left untouched. Returns None when no video URI is found.
+fn with_from_in_master(body: &[u8], from: usize) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    if !text.contains("#EXT-X-STREAM-INF") {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut patched = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if !patched
+            && (line.starts_with("http://") || line.starts_with("https://"))
+            && line.contains(".m3u8")
+            && !line.contains("/sub/")
+        {
+            let sep = if line.contains('?') { '&' } else { '?' };
+            out.push(format!("{line}{sep}from={from}"));
+            patched = true;
+        } else {
+            out.push(raw.to_string());
+        }
+    }
+    if !patched {
+        return None;
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    Some(s.into_bytes())
 }
 
 /// Session fetch status for the Diagnostics view: `downloading` (green,
@@ -236,6 +412,7 @@ pub fn start_proxy(
         last_error_ms: 0,
         last_error: None,
         recent: VecDeque::new(),
+        fetch_epoch: 0,
         verbose,
         source: None,
         on_log: None,
@@ -390,6 +567,15 @@ fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
     if want == 0 {
         return;
     }
+    // New generation: any fill thread from an older seek window is stale
+    // and stops before its next segment, so only the current position +10%
+    // is fetched even when the user keeps seeking. Bumped even when the
+    // window is already full, so stragglers stand down and nothing runs.
+    let epoch = {
+        let mut st = state.lock().unwrap();
+        st.fetch_epoch += 1;
+        st.fetch_epoch
+    };
     let have = {
         let st = state.lock().unwrap();
         (start..total)
@@ -400,7 +586,7 @@ fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
         return;
     }
     thread::spawn(move || {
-        fill_range(&segments, &headers, &state, &stop, start, want);
+        fill_range(&segments, &headers, &state, &stop, start, want, epoch);
     });
 }
 
@@ -415,7 +601,8 @@ pub(crate) fn readahead_window(total: usize, start: usize) -> usize {
 }
 
 /// Download [start, start+count) into the cache. Skips cached entries,
-/// stops at the first failure or when the proxy shuts down.
+/// stops at the first failure, when the proxy shuts down, or when a newer
+/// seek bumped the epoch (this window is stale).
 fn fill_range(
     segments: &[String],
     headers: &HashMap<String, String>,
@@ -423,11 +610,15 @@ fn fill_range(
     stop: &AtomicBool,
     start: usize,
     count: usize,
+    epoch: u64,
 ) {
     let rest_ext = "ts";
     let end = (start + count).min(segments.len());
     for n in start..end {
         if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if state.lock().unwrap().fetch_epoch != epoch {
             break;
         }
         if state.lock().unwrap().seg_cache.contains_key(&n) {
@@ -564,6 +755,15 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or(&url);
     if let Some(body) = state.lock().unwrap().files.get(path).cloned() {
+        // Click-to-seek on a subtitle-bundled session opens the master with
+        // `?from=N`: point its video URI at the trimmed media playlist so
+        // the relaunch keeps subtitles.
+        if let Some(from) = query_from(&url) {
+            if let Some(master) = with_from_in_master(&body, from) {
+                respond_bytes(request, master, file_content_type(path));
+                return;
+            }
+        }
         respond_bytes(request, body, file_content_type(path));
         return;
     }
@@ -584,6 +784,12 @@ fn handle(request: tiny_http::Request, state: &Arc<Mutex<ProxyState>>, stop: &Ar
             && !path.starts_with("/sub/"))
     {
         let body = state.lock().unwrap().playlist.clone();
+        // Click-to-seek opens the media playlist with `?from=N`: serve it
+        // trimmed so VLC starts there. Out-of-range values fall back to
+        // the full playlist.
+        let body = query_from(&url)
+            .and_then(|from| trim_playlist(&body, from))
+            .unwrap_or(body);
         let resp = Response::new(
             StatusCode(200),
             vec![
@@ -931,6 +1137,187 @@ mod tests {
         assert_eq!(fetch_status(100, 3, 10, 0, now - 60_000, 0, now), "idle");
         // Fresh session, nothing yet.
         assert_eq!(fetch_status(0, 0, 0, 0, 0, 0, now), "idle");
+    }
+
+    fn blank_state(segments: Vec<String>, epoch: u64) -> Mutex<ProxyState> {
+        Mutex::new(ProxyState {
+            playlist: Vec::new(),
+            headers: HashMap::new(),
+            segments,
+            files: HashMap::new(),
+            seg_cache: HashMap::new(),
+            served_cur: None,
+            served_max: None,
+            served_count: 0,
+            cached_bytes: 0,
+            fetched_bytes: 0,
+            fetch_inflight: 0,
+            last_ok_ms: 0,
+            last_error_ms: 0,
+            last_error: None,
+            recent: VecDeque::new(),
+            fetch_epoch: epoch,
+            verbose: false,
+            source: None,
+            on_log: None,
+            pending_log: Vec::new(),
+            log_fail: 0,
+        })
+    }
+
+    #[test]
+    fn test_fill_range_stale_epoch_fetches_nothing() {
+        // A seek moved the epoch on: the stale window must do zero work —
+        // no step reports, no cache writes, and no fetch is even attempted
+        // (an attempt would leave fetch marks behind).
+        let segments = vec!["http://127.0.0.1:1/bogus-0.ts".to_string()];
+        let headers = HashMap::new();
+        let state = blank_state(segments.clone(), 7);
+        let stop = AtomicBool::new(false);
+        fill_range(&segments, &headers, &state, &stop, 0, 1, 6);
+        let st = state.lock().unwrap();
+        assert!(st.seg_cache.is_empty());
+        assert_eq!(st.last_error_ms, 0);
+        assert_eq!(st.last_ok_ms, 0);
+        assert_eq!(st.fetch_inflight, 0);
+    }
+
+    #[test]
+    fn test_fill_range_current_epoch_reports_cached_without_fetching() {
+        // The live window proceeds: cached entries report steps, and with
+        // everything cached no upstream fetch is attempted.
+        let segments = vec!["http://127.0.0.1:1/x.ts".to_string()];
+        let headers = HashMap::new();
+        let state = blank_state(segments.clone(), 7);
+        state.lock().unwrap().seg_cache.insert(0, vec![1, 2, 3]);
+        let stop = AtomicBool::new(false);
+        fill_range(&segments, &headers, &state, &stop, 0, 1, 7);
+        let st = state.lock().unwrap();
+        assert_eq!(st.seg_cache.len(), 1);
+        assert_eq!(st.last_error_ms, 0);
+        assert_eq!(st.last_ok_ms, 0);
+    }
+
+    #[test]
+    fn test_trigger_readahead_bumps_epoch_without_spawning_when_full() {
+        // Window already full: no fill thread spawns, but the epoch still
+        // bumps so any straggler from an older seek stands down.
+        let segments: Vec<String> =
+            (0..10).map(|n| format!("http://127.0.0.1:1/s{n}.ts")).collect();
+        let state = Arc::new(blank_state(segments, 0));
+        {
+            let mut st = state.lock().unwrap();
+            for n in 0..10 {
+                st.seg_cache.insert(n, vec![0]);
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        trigger_readahead(state.clone(), stop);
+        assert_eq!(state.lock().unwrap().fetch_epoch, 1);
+    }
+
+    const TRIM_FIXTURE: &str = "#EXTM3U\n\
+         #EXT-X-VERSION:3\n\
+         #EXT-X-TARGETDURATION:6\n\
+         #EXT-X-MEDIA-SEQUENCE:5\n\
+         #EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:9/seg/00007.key\"\n\
+         #EXTINF:6.0,\n\
+         http://127.0.0.1:9/seg/00007.ts\n\
+         #EXTINF:6.0,\n\
+         http://127.0.0.1:9/seg/00008.ts\n\
+         #EXT-X-KEY:METHOD=NONE\n\
+         #EXTINF:6.0,\n\
+         http://127.0.0.1:9/seg/00009.ts\n\
+         #EXTINF:6.0,\n\
+         http://127.0.0.1:9/seg/00010.ts\n\
+         #EXT-X-ENDLIST\n";
+
+    #[test]
+    fn test_seg_offset_secs_sums_earlier_durations() {
+        let body = "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:8\n\
+             #EXTINF:8.0,\n\
+             http://127.0.0.1:9/seg/00007.ts\n\
+             #EXT-X-KEY:METHOD=NONE\n\
+             #EXTINF:4.5,\n\
+             http://127.0.0.1:9/seg/00008.ts\n\
+             #EXTINF:6.0,\n\
+             http://127.0.0.1:9/seg/00009.ts\n\
+             #EXT-X-ENDLIST\n";
+        assert_eq!(seg_offset_secs(body.as_bytes(), 7), 0.0);
+        assert_eq!(seg_offset_secs(body.as_bytes(), 8), 8.0);
+        assert_eq!(seg_offset_secs(body.as_bytes(), 9), 12.5);
+        // Missing durations count as 0 rather than breaking the sum.
+        let bare = "#EXTM3U\nhttp://127.0.0.1:9/seg/00000.ts\n";
+        assert_eq!(seg_offset_secs(bare.as_bytes(), 1), 0.0);
+        assert_eq!(seg_offset_secs(b"not utf8 \xff", 3), 0.0);
+    }
+
+    #[test]
+    fn test_query_from_parses_seek_param() {
+        assert_eq!(query_from("/x.m3u8?from=12"), Some(12));
+        assert_eq!(query_from("/x.m3u8?foo=1&from=3"), Some(3));
+        assert_eq!(query_from("/x.m3u8"), None);
+        assert_eq!(query_from("/x.m3u8?from=abc"), None);
+    }
+
+    #[test]
+    fn test_trim_playlist_zero_is_identity() {
+        assert_eq!(
+            trim_playlist(TRIM_FIXTURE.as_bytes(), 0),
+            Some(TRIM_FIXTURE.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn test_trim_playlist_drops_earlier_segments() {
+        let out = String::from_utf8(trim_playlist(TRIM_FIXTURE.as_bytes(), 8).unwrap()).unwrap();
+        assert!(
+            out.contains("#EXT-X-MEDIA-SEQUENCE:6"),
+            "sequence advances by dropped count, got:\n{out}"
+        );
+        assert!(!out.contains("00007.ts"), "earlier segment is gone:\n{out}");
+        assert!(out.contains("00008.ts"));
+        assert!(out.contains("00010.ts"));
+        assert!(out.contains("#EXT-X-ENDLIST"));
+        // The AES key from the dropped region rides along to the first kept
+        // segment; the EXTINF orphan of the dropped segment does not.
+        assert_eq!(out.matches("00007.key").count(), 1);
+        assert_eq!(out.matches("#EXTINF").count(), 3);
+    }
+
+    #[test]
+    fn test_trim_playlist_inserts_sequence_when_missing() {
+        let no_seq = TRIM_FIXTURE.replace("#EXT-X-MEDIA-SEQUENCE:5\n", "");
+        let out = String::from_utf8(trim_playlist(no_seq.as_bytes(), 9).unwrap()).unwrap();
+        assert!(
+            out.contains("#EXT-X-MEDIA-SEQUENCE:2"),
+            "two dropped entries, got:\n{out}"
+        );
+        assert!(out.contains("00009.ts"));
+        assert!(!out.contains("00008.ts"));
+    }
+
+    #[test]
+    fn test_trim_playlist_past_end_is_none() {
+        assert_eq!(trim_playlist(TRIM_FIXTURE.as_bytes(), 99), None);
+    }
+
+    #[test]
+    fn test_with_from_in_master_points_video_at_trim() {
+        let master = "#EXTM3U\n\
+             #EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,URI=\"http://127.0.0.1:9/sub/0.vtt\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES=\"subs\"\n\
+             http://127.0.0.1:9/My_Show.m3u8\n";
+        let out =
+            String::from_utf8(with_from_in_master(master.as_bytes(), 4).unwrap()).unwrap();
+        assert!(out.contains("http://127.0.0.1:9/My_Show.m3u8?from=4"), "got:\n{out}");
+        assert!(
+            out.contains("URI=\"http://127.0.0.1:9/sub/0.vtt\""),
+            "sub URI untouched:\n{out}"
+        );
+        assert_eq!(with_from_in_master(b"#EXTM3U\n#EXT-X-VERSION:3\n", 4), None);
     }
 
     #[test]

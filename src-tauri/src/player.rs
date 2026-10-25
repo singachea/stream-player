@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -21,6 +22,58 @@ pub fn vlc_path() -> PathBuf {
     std::env::var("VLC")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(VLC_BIN))
+}
+
+/// A free loopback port for this VLC instance's remote-control channel.
+fn free_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()?
+        .local_addr()
+        .ok()
+        .map(|a| a.port())
+}
+
+/// Remote-control listener args for one VLC instance. `--extraintf` keeps
+/// the normal GUI while adding the line-based remote-control interface
+/// (module `oldrc` in VLC 3.x builds: `seek X` seeks X seconds), so the
+/// app can seek the running player instead of relaunching it.
+/// `--rc-fake-tty` is required: without a TTY on stdin `oldrc` refuses to
+/// start at all (verified live against VLC 3.0.23: the TCP listener only
+/// comes up with this flag, and stays up on a DEVNULL stdin).
+pub fn rc_args(port: u16) -> Vec<String> {
+    vec![
+        "--extraintf=oldrc".into(),
+        format!("--rc-host=127.0.0.1:{port}"),
+        "--rc-fake-tty".into(),
+    ]
+}
+
+/// Absolute `seek <secs>` on a running instance's RC channel, with short
+/// retries for a listener that is still coming up. A successful write is
+/// success: rc replies vary by VLC version, so nothing is parsed. Worst
+/// case ~1s, and the caller runs off the main thread regardless.
+pub fn rc_seek(port: u16, secs: u64) -> Result<()> {
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| Error::msg(format!("play: bad rc addr: {e}")))?;
+    let mut last = "unreachable".to_string();
+    for _ in 0..3 {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+            Ok(mut stream) => {
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                match stream.write_all(format!("seek {secs}\n").as_bytes()) {
+                    Ok(()) => {
+                        let _ = stream.flush();
+                        return Ok(());
+                    }
+                    Err(e) => last = e.to_string(),
+                }
+            }
+            Err(e) => last = e.to_string(),
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(Error::msg(format!("play: rc seek 127.0.0.1:{port}: {last}")))
 }
 
 pub fn vlc_launch_args(vlc: &Path, media_args: &[&str]) -> Vec<String> {
@@ -130,6 +183,11 @@ pub struct Playback {
     pub child: Child,
     pub hint: String,
     pub play_url: String,
+    /// This instance's remote-control port, if one was allocated.
+    pub rc_port: Option<u16>,
+    /// VLC args (subtitle options) excluding the play URL, kept so a
+    /// seek relaunch preserves subtitles.
+    pub sub_args: Vec<String>,
     /// Staged subtitle files handed to VLC by local path. The caller moves
     /// these into the stream session; `stop()` removes any left behind.
     pub staged_subs: Vec<std::path::PathBuf>,
@@ -363,6 +421,11 @@ where
         }
     }
     let mut args = vlc_sub_options(&sidecar, embedded);
+    let rc_port = free_loopback_port();
+    if let Some(port) = rc_port {
+        args.extend(rc_args(port));
+    }
+    let sub_args = args.clone();
     args.push(play_url.clone());
     if verbose {
         eprintln!("play: vlc sub args {}", sidecar.join(", "));
@@ -389,6 +452,8 @@ where
         child,
         hint,
         play_url,
+        rc_port,
+        sub_args,
         staged_subs: staged,
     })
 }
@@ -507,6 +572,11 @@ pub fn start_http_playback(
         eprintln!("play: local file {local}");
     }
     let mut args = vlc_sub_options(&sidecar, false);
+    let rc_port = free_loopback_port();
+    if let Some(port) = rc_port {
+        args.extend(rc_args(port));
+    }
+    let sub_args = args.clone();
     args.push(local.clone());
     if verbose {
         eprintln!("play: vlc sub args {}", sidecar.join(", "));
@@ -524,6 +594,8 @@ pub fn start_http_playback(
             format!("http subs={}", sidecar.len())
         },
         play_url: local,
+        rc_port,
+        sub_args,
         staged_subs: staged,
     })
 }
@@ -552,6 +624,47 @@ mod tests {
             );
             assert!(!a.contains("NSQuit"));
         }
+    }
+
+    #[test]
+    fn test_rc_args_keep_gui_and_listen_on_loopback() {
+        // `oldrc` is the module name in VLC 3.x builds (verified against
+        // the bundled liboldrc_plugin.dylib, which serves `seek X`).
+        let args = rc_args(4212);
+        assert!(args.iter().any(|a| a == "--extraintf=oldrc"));
+        assert!(args.iter().any(|a| a == "--rc-host=127.0.0.1:4212"));
+        assert!(args.iter().any(|a| a == "--rc-fake-tty"));
+    }
+
+    #[test]
+    fn test_rc_seek_writes_seek_command() {
+        // Stand-in for VLC's rc listener: assert the exact line protocol.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let got2 = got.clone();
+        let t = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(&stream);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            *got2.lock().unwrap() = line;
+            let _ = stream.write_all(b"ok\n");
+        });
+        rc_seek(port, 42).unwrap();
+        t.join().unwrap();
+        assert_eq!(got.lock().unwrap().as_str(), "seek 42\n");
+    }
+
+    #[test]
+    fn test_rc_seek_refused_is_an_error() {
+        // Bind-then-drop reserves a (virtually certainly) closed port.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(rc_seek(port, 1).is_err());
     }
 
     #[test]

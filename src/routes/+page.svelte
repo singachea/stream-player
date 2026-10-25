@@ -18,8 +18,8 @@
   import { toastStore } from "$lib/stores/toasts.svelte";
   import ToastStack from "$lib/components/ToastStack.svelte";
   import RefererDialog from "$lib/components/RefererDialog.svelte";
-  import DebugLog from "$lib/components/DebugLog.svelte";
   import DiagnosticsPane from "$lib/components/DiagnosticsPane.svelte";
+  import StreamProxies from "$lib/components/StreamProxies.svelte";
   import JobsPane from "$lib/components/JobsPane.svelte";
   import SettingsPane from "$lib/components/SettingsPane.svelte";
   import StreamsPane from "$lib/components/StreamsPane.svelte";
@@ -51,6 +51,7 @@
   let pasteMenu = $state(false);
   let jobs = $state<Job[]>([]);
   let streams = $state<api.StreamSession[]>([]);
+  let proxiesRef = $state<{ expand: (id: number) => void }>();
   let needReferer = $state<NeedReferer | null>(null);
   let pendingAfterReferer = $state<"resolve" | "play" | "download" | null>(
     null,
@@ -173,6 +174,21 @@
     ];
   }
 
+  // Incoming `play-log` events are buffered and merged twice a second so
+  // a backend burst (e.g. VLC decoder spam after a seek) re-renders the
+  // log at most twice per second instead of once per line.
+  let pendingLogs: LogLine[] = [];
+  function flushLogs() {
+    if (!pendingLogs.length) return;
+    const batch = pendingLogs;
+    pendingLogs = [];
+    logs = [...logs, ...batch].slice(-500);
+  }
+  function clearLogs() {
+    pendingLogs = [];
+    logs = [];
+  }
+
   function statusRank(s: Job["status"]) {
     switch (s) {
       case "queued":
@@ -269,8 +285,11 @@
       const s = e.payload;
       if (s?.id == null) return;
       const i = streams.findIndex((x) => x.id === s.id);
-      if (i < 0) streams = [...streams, s];
-      else streams = streams.map((x, k) => (k === i ? s : x));
+      if (i < 0) {
+        streams = [...streams, s];
+        // A stream just appeared (play started it): open its detail grid.
+        proxiesRef?.expand(s.id);
+      } else streams = streams.map((x, k) => (k === i ? s : x));
     }).then((u) => unsubs.push(u));
     void listen<number>("stream-removed", (e) => {
       streams = streams.filter((x) => x.id !== e.payload);
@@ -294,6 +313,7 @@
     window.addEventListener("focus", onFocus);
     void offerClipboard();
     startStreamPolling();
+    startLogFlushing();
     void listen<LogLine>("play-log", (e) => {
       const line = e.payload;
       if (!line?.msg) return;
@@ -301,22 +321,20 @@
         line.source === "vlc" || line.source === "job" || line.source === "play"
           ? line.source
           : "play";
-      logs = [
-        ...logs.slice(-499),
-        {
-          ms: line.ms || Date.now(),
-          level: line.level || "info",
-          msg: line.msg,
-          source,
-          id: line.id ?? null,
-        },
-      ];
+      pendingLogs.push({
+        ms: line.ms || Date.now(),
+        level: line.level || "info",
+        msg: line.msg,
+        source,
+        id: line.id ?? null,
+      });
     }).then((u) => unsubs.push(u));
     return () => {
       unsubs.forEach((u) => u());
       document.removeEventListener("click", onDocClick);
       window.removeEventListener("focus", onFocus);
       window.clearInterval(streamPoller);
+      window.clearInterval(logFlusher);
     };
   });
 
@@ -635,11 +653,26 @@
     }, 1500);
   }
 
+  let logFlusher: number | undefined;
+  function startLogFlushing() {
+    window.clearInterval(logFlusher);
+    logFlusher = window.setInterval(flushLogs, 500);
+  }
+
   async function stopStream(id: number) {
     try {
       await api.stopStream(id);
       streams = streams.filter((x) => x.id !== id);
       addLog("info", `stopped stream ${id}`);
+    } catch (e) {
+      toastStore.push("error", String(e));
+    }
+  }
+
+  async function seekStream(id: number, seg: number) {
+    try {
+      await api.seekStream(id, seg);
+      addLog("info", `seek stream ${id} → seg ${seg}`);
     } catch (e) {
       toastStore.push("error", String(e));
     }
@@ -726,6 +759,7 @@
   }
 
   async function copyLogs() {
+    flushLogs();
     if (!visibleLogs.length) return;
     const text = visibleLogs.map(formatLogLine).join("\n");
     try {
@@ -777,7 +811,7 @@
       {streams}
       onStop={(id) => void stopStream(id)}
     />
-    <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden p-4">
+    <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-auto p-4">
     <section class="rounded-xl border border-surface-800 bg-surface-900 p-4">
       <div class="flex items-center justify-between gap-2">
         <label
@@ -1067,13 +1101,11 @@
 
     </section>
 
-    <DebugLog
-      lines={visibleLogs}
-      total={logs.length}
-      filter={logFilter}
-      onFilter={(f) => (logFilter = f)}
-      onClear={() => (logs = [])}
-      onCopy={() => void copyLogs()}
+    <StreamProxies
+      bind:this={proxiesRef}
+      {streams}
+      onStopStream={(id) => void stopStream(id)}
+      onSeekStream={(id, seg) => void seekStream(id, seg)}
     />
 
     </div>
@@ -1097,7 +1129,11 @@
       {streams}
       {jobs}
       logTotal={logs.length}
-      onStopStream={(id) => void stopStream(id)}
+      logLines={visibleLogs}
+      logFilter={logFilter}
+      onLogFilter={(f) => (logFilter = f)}
+      onLogClear={() => clearLogs()}
+      onLogCopy={() => void copyLogs()}
     />
   </main>
   {:else}
