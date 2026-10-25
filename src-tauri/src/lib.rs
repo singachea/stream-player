@@ -41,6 +41,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::resolve_cmd,
             commands::play_cmd,
+            commands::cancel_op_cmd,
             commands::stop_cmd,
             commands::list_streams_cmd,
             commands::stop_stream_cmd,

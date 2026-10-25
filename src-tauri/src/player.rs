@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::fetch::http_get;
+use crate::fetch::{current_cancel, http_get};
 use crate::hls::{
     filter_subtitles, is_subtitle_url, local_master_playlist, map_or_first_segment_url,
     playlist_hint, resolve_media_playlist, rewrite_media_playlist, sniff_segment_kind,
@@ -338,6 +338,11 @@ impl Playback {
 }
 
 pub fn spawn_vlc(vlc: &Path, media_args: &[&str]) -> Result<Child> {
+    // A cancelled play/resolve must never open VLC late: the UI already
+    // re-enabled Play under a new generation.
+    if current_cancel().is_some_and(|c| c.is_cancelled()) {
+        return Err(Error::msg("play: cancelled"));
+    }
     require_vlc(vlc)?;
     let args = vlc_launch_args(vlc, media_args);
     Command::new(&args[0])

@@ -751,8 +751,12 @@ pub(crate) fn readahead_window(total: usize, start: usize) -> usize {
 }
 
 /// Download [start, start+count) into the cache. Skips cached entries,
-/// stops at the first failure, when the proxy shuts down, or when a newer
-/// seek bumped the epoch (this window is stale).
+/// stops when the proxy shuts down or a newer seek bumped the epoch (this
+/// window is stale). A failed segment is skipped, not fatal: one blip
+/// must not abandon the rest of the window, and the next trigger
+/// re-attempts skipped entries within one segment-playback time.
+/// Three failures in a row mean real outage: stand down and let
+/// on-demand serves surface it instead of hammering a dead host.
 fn fill_range(
     segments: &[String],
     headers: &HashMap<String, String>,
@@ -764,6 +768,7 @@ fn fill_range(
 ) {
     let rest_ext = "ts";
     let end = (start + count).min(segments.len());
+    let mut consecutive_failures = 0u32;
     for n in start..end {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -772,6 +777,7 @@ fn fill_range(
             break;
         }
         if state.lock().unwrap().seg_cache.contains_key(&n) {
+            consecutive_failures = 0;
             continue;
         }
         let Some(src) = segments.get(n) else {
@@ -781,6 +787,7 @@ fn fill_range(
         note_fetch_begin(state);
         match fetch_segment_body(src, &mut hdrs, rest_ext) {
             Some(body) => {
+                consecutive_failures = 0;
                 let bytes = body.len() as u64;
                 note_fetch_ok(state, bytes);
                 let mut st = state.lock().unwrap();
@@ -788,8 +795,11 @@ fn fill_range(
                 st.seg_cache.insert(n, body);
             }
             None => {
+                consecutive_failures += 1;
                 note_fetch_err(state, format!("readahead seg {n} → upstream failed"));
-                break;
+                if consecutive_failures >= 3 {
+                    break;
+                }
             }
         }
     }
@@ -1482,6 +1492,27 @@ pub(crate) mod tests {
         assert!(st.seg_cache.is_empty());
         assert_eq!(st.last_error_ms, 0);
         assert_eq!(st.last_ok_ms, 0);
+        assert_eq!(st.fetch_inflight, 0);
+    }
+
+    #[test]
+    fn test_fill_range_stops_after_three_consecutive_failures() {
+        // Bogus loopback URLs fail fast (connection refused): over 5
+        // segments the fill must attempt exactly 0, 1, 2, then stand
+        // down — the last error names seg 2, never 3 or 4.
+        let segments: Vec<String> = (0..5)
+            .map(|n| format!("http://127.0.0.1:1/bogus-{n}.ts"))
+            .collect();
+        let headers = HashMap::new();
+        let state = blank_state(segments.clone(), 7);
+        let stop = AtomicBool::new(false);
+        fill_range(&segments, &headers, &state, &stop, 0, 5, 7);
+        let st = state.lock().unwrap();
+        assert!(st.seg_cache.is_empty());
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("readahead seg 2 → upstream failed")
+        );
         assert_eq!(st.fetch_inflight, 0);
     }
 

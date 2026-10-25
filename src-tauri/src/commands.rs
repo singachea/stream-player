@@ -16,7 +16,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::download::{clamp_workers, download_stream, DEFAULT_WORKERS, MAX_WORKERS, MIN_WORKERS};
 use crate::error::Error;
-use crate::fetch::{http_get_maybe_playlist, http_headers, CancelCtx, MaybePlaylist};
+use crate::fetch::{
+    http_get_maybe_playlist, http_headers, with_cancel, CancelCtx, MaybePlaylist,
+};
 use crate::hls::{
     parse_subtitle_tracks, parse_variants, ranked_variants, subtitle_label, variant_label, Variant,
 };
@@ -50,6 +52,9 @@ pub struct AppState {
     pub pending_capture: Mutex<Option<ParsedCurl>>,
     pub streams: TrackedMutex<BTreeMap<u64, StreamSession>>,
     pub stream_seq: AtomicU64,
+    /// Cancel context of the current resolve/play op. A new op stands down
+    /// the previous one; `cancel_op_cmd` trips it from the UI.
+    pub op_cancel: Mutex<CancelCtx>,
 }
 
 impl AppState {
@@ -64,6 +69,7 @@ impl AppState {
             pending_capture: Mutex::new(None),
             streams: TrackedMutex::new(BTreeMap::new()),
             stream_seq: AtomicU64::new(1),
+            op_cancel: Mutex::new(CancelCtx::new()),
         }
     }
 }
@@ -1026,6 +1032,25 @@ pub fn delete_host_cmd(
     list_hosts_cmd(app, state)
 }
 
+/// Start a UI-cancellable op (resolve/play): stand down any previous op,
+/// then hand out a fresh context the new op installs with `with_cancel`.
+/// Fetch stages already honor the thread-local context (tracked curl PIDs
+/// die on request), and the frontend discards late results by generation.
+fn begin_op(state: &AppState) -> CancelCtx {
+    let mut slot = state.op_cancel.lock().unwrap();
+    slot.request();
+    *slot = CancelCtx::new();
+    slot.clone()
+}
+
+/// Trip the current resolve/play op from the UI cancel button. In-flight
+/// curls die at once; staged work aborts at its next cancel check.
+#[tauri::command]
+pub fn cancel_op_cmd(state: State<'_, AppState>) -> Result<(), String> {
+    state.op_cancel.lock().unwrap().request();
+    Ok(())
+}
+
 #[tauri::command(async)]
 pub async fn resolve_cmd(
     app: AppHandle,
@@ -1039,8 +1064,11 @@ pub async fn resolve_cmd(
 ) -> Result<ResolveResponse, String> {
     let app2 = app.clone();
     let dir = workdir(&app, &state);
+    let ctx = begin_op(&state);
     tauri::async_runtime::spawn_blocking(move || {
-        resolve_blocking(&app2, &dir, &url, referer, origin, user_agent, cookie, cookie_host)
+        with_cancel(Some(&ctx), || {
+            resolve_blocking(&app2, &dir, &url, referer, origin, user_agent, cookie, cookie_host)
+        })
     })
     .await
     .map_err(|e| format!("play: resolve task failed: {e}"))?
@@ -1181,23 +1209,26 @@ pub async fn play_cmd(
 ) -> Result<ResolveResponse, String> {
     let app2 = app.clone();
     let dir = workdir(&app, &state);
+    let ctx = begin_op(&state);
     tauri::async_runtime::spawn_blocking(move || {
-        play_blocking(
-            &app2,
-            &dir,
-            &url,
-            quality,
-            referer,
-            origin,
-            user_agent,
-            cookie,
-            cookie_host,
-            extra,
-            subtitles,
-            subtitle,
-            prefetch_count,
-            title,
-        )
+        with_cancel(Some(&ctx), || {
+            play_blocking(
+                &app2,
+                &dir,
+                &url,
+                quality,
+                referer,
+                origin,
+                user_agent,
+                cookie,
+                cookie_host,
+                extra,
+                subtitles,
+                subtitle,
+                prefetch_count,
+                title,
+            )
+        })
     })
     .await
     .map_err(|e| format!("play: play task failed: {e}"))?
@@ -2404,6 +2435,18 @@ mod tests {
         let _held = state.lock().unwrap();
         assert!(dto_from_snap(&snap).is_none());
         assert!(file_session_dto(&snap, 0).is_none());
+    }
+
+    #[test]
+    fn test_begin_op_stands_down_previous() {
+        // A new op cancels the previous context and installs a live one,
+        // so stale curls die and only the latest op can open VLC.
+        let state = AppState::new();
+        let first = begin_op(&state);
+        assert!(!first.is_cancelled());
+        let second = begin_op(&state);
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
     }
 
     #[test]
