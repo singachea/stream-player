@@ -95,6 +95,10 @@ export function stop(): Promise<void> {
   return invoke("stop_cmd");
 }
 
+export function cancelOp(): Promise<void> {
+  return invoke("cancel_op_cmd");
+}
+
 export interface StreamSession {
   id: number;
   url: string;

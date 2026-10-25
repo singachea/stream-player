@@ -48,10 +48,8 @@
   let resolving = $state(false);
   let playing = $state(false);
   let extraCount = $state(0);
-  let pasteMenu = $state(false);
   let jobs = $state<Job[]>([]);
   let streams = $state<api.StreamSession[]>([]);
-  let proxiesRef = $state<{ expand: (id: number) => void }>();
   let needReferer = $state<NeedReferer | null>(null);
   let pendingAfterReferer = $state<"resolve" | "play" | "download" | null>(
     null,
@@ -287,8 +285,6 @@
       const i = streams.findIndex((x) => x.id === s.id);
       if (i < 0) {
         streams = [...streams, s];
-        // A stream just appeared (play started it): open its detail grid.
-        proxiesRef?.expand(s.id);
       } else streams = streams.map((x, k) => (k === i ? s : x));
     }).then((u) => unsubs.push(u));
     void listen<number>("stream-removed", (e) => {
@@ -305,11 +301,6 @@
     function onFocus() {
       void offerClipboard();
     }
-    function onDocClick(ev: MouseEvent) {
-      const t = ev.target as HTMLElement | null;
-      if (t && !t.closest("[data-paste-split]")) pasteMenu = false;
-    }
-    document.addEventListener("click", onDocClick);
     window.addEventListener("focus", onFocus);
     void offerClipboard();
     startStreamPolling();
@@ -331,7 +322,6 @@
     }).then((u) => unsubs.push(u));
     return () => {
       unsubs.forEach((u) => u());
-      document.removeEventListener("click", onDocClick);
       window.removeEventListener("focus", onFocus);
       window.clearInterval(streamPoller);
       window.clearInterval(logFlusher);
@@ -429,7 +419,28 @@
   }
 
   let resolveGen = 0;
+  let playGen = 0;
   let resolveTimer: number | undefined;
+
+  /**
+   * Abort the in-flight resolve/play op and re-enable the buttons at once.
+   * Backend curls die via cancel_op_cmd; the generation bumps discard any
+   * late success, so this can never double-play. Downloads are untouched
+   * (per-job cancel lives in the Jobs pane).
+   */
+  function cancelOp() {
+    resolveGen += 1;
+    playGen += 1;
+    window.clearTimeout(resolveTimer);
+    resolving = false;
+    busy = false;
+    playingOp = null;
+    playStage = "";
+    playDone = 0;
+    playTotal = 1;
+    pendingExtra = false;
+    void api.cancelOp().catch(() => {});
+  }
 
   function scheduleResolve() {
     window.clearTimeout(resolveTimer);
@@ -572,6 +583,7 @@
 
   async function doPlay(extra = false) {
     if (!canPlay) return;
+    const gen = ++playGen;
     const u = cleanUrl(url);
     busy = true;
     playingOp = "play";
@@ -587,6 +599,7 @@
         subtitle,
         title: title.trim() || null,
       });
+      if (gen !== playGen) return;
       pendingAfterReferer = "play";
       if (!applyPlayResult(res)) return;
       playing = true;
@@ -597,8 +610,10 @@
         extra ? "Opened another VLC" : "Opened in VLC",
       );
     } catch (e) {
+      if (gen !== playGen) return;
       toastStore.push("error", String(e));
     } finally {
+      if (gen !== playGen) return;
       busy = false;
       playingOp = null;
       playStage = "";
@@ -820,10 +835,11 @@
         {/if}
       </div>
       <div class="mt-1.5 flex items-center gap-2">
-        <input
-          id="stream-url"
-          bind:this={urlBox}
-          class="min-w-0 flex-1 rounded-lg border border-surface-600 bg-surface-850 px-3 py-2 font-mono text-sm outline-none ring-accent-500 focus:border-accent-500 focus:ring-2"
+        <div class="relative min-w-0 flex-1">
+          <input
+            id="stream-url"
+            bind:this={urlBox}
+            class="w-full rounded-lg border border-surface-600 bg-surface-850 py-2 pr-36 pl-3 font-mono text-sm outline-none ring-accent-500 focus:border-accent-500 focus:ring-2"
           type="text"
           placeholder="https://cdn.example/hls/master.m3u8 or paste Copy as cURL"
           spellcheck="false"
@@ -847,72 +863,108 @@
               void doPlay(false);
             }
           }}
-        />
-        <div class="grid shrink-0 grid-cols-[auto_auto_auto] items-center gap-2">
-          <div class="relative col-start-1 row-start-1" data-paste-split>
-            <div class="flex">
-              <button
-                type="button"
-                class="rounded-l-lg border border-surface-600 bg-surface-800 px-3 py-2 text-sm font-medium text-surface-100 hover:bg-surface-700"
-                onclick={() => {
-                  pasteMenu = false;
-                  void pasteUrl();
-                }}
-                title="Paste URL or Copy as cURL from DevTools"
+          />
+          <div
+            class="absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5"
+          >
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-sm leading-none text-surface-400 hover:bg-surface-700 hover:text-surface-100 disabled:invisible"
+              disabled={!(resolving || playingOp !== null)}
+              onclick={cancelOp}
+              aria-label="Cancel loading"
+              title="Cancel quality listing / play"
+            >
+              ✕
+            </button>
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-surface-400 hover:bg-surface-700 hover:text-surface-100 disabled:opacity-40"
+              disabled={!canPlay}
+              onclick={() => doPlay(true)}
+              aria-label="Play in another VLC instance"
+              title="Open another VLC instance"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-5 w-5"
+                aria-hidden="true"
               >
-                Paste
-              </button>
-              <button
-                type="button"
-                class="rounded-r-lg border border-l-0 border-surface-600 bg-surface-800 px-2 text-surface-300 hover:bg-surface-700"
-                onclick={(e) => {
-                  e.stopPropagation();
-                  pasteMenu = !pasteMenu;
-                }}
-                aria-label="More paste options"
-                aria-expanded={pasteMenu}
-                title="More paste options"
+                <path d="M7 7v10l8-5z" />
+                <path d="M18.5 8.5v5" />
+                <path d="M16 11h5" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-surface-400 hover:bg-surface-700 hover:text-surface-100"
+              onclick={() => void pasteUrl()}
+              aria-label="Paste URL"
+              title="Paste URL or Copy as cURL from DevTools"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-4 w-4"
+                aria-hidden="true"
               >
-                ▾
-              </button>
-            </div>
-            {#if pasteMenu}
-              <div
-                class="absolute left-0 top-full z-20 mt-1 min-w-36 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 py-1 shadow-xl"
+                <rect x="6" y="4" width="12" height="17" rx="2" />
+                <rect x="9" y="2" width="6" height="4" rx="1" />
+                <line x1="9.5" x2="14.5" y1="10" y2="10" />
+                <line x1="9.5" x2="14.5" y1="14" y2="14" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-surface-400 hover:bg-surface-700 hover:text-surface-100 disabled:opacity-40"
+              disabled={!cleanUrl(url)}
+              onclick={() => void doDownload()}
+              aria-label="Download stream"
+              title="Download this stream to a file"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-4 w-4"
+                aria-hidden="true"
               >
-                <button
-                  type="button"
-                  class="block w-full px-3 py-2 text-left text-sm text-surface-100 hover:bg-surface-800 disabled:opacity-45"
-                  disabled={!cleanUrl(url)}
-                  onclick={() => {
-                    pasteMenu = false;
-                    void doDownload();
-                  }}
-                  title="Download this stream to a file"
-                >
-                  Download
-                </button>
-              </div>
-            {/if}
+                <path d="M12 4v11" />
+                <path d="m8 11 4 4 4-4" />
+                <path d="M5 20h14" />
+              </svg>
+            </button>
           </div>
-          <button
-            type="button"
-            class="col-start-2 row-start-1 rounded-lg border border-accent-600 bg-accent-600/15 px-3 py-2 text-sm font-medium text-accent-400 hover:bg-accent-600/25 disabled:opacity-45"
-            onclick={() => doPlay(true)}
-            disabled={!canPlay}
-            title="Open another VLC instance"
-          >
-            {playingOp === "play" ? "Opening…" : "Play +1"}
-          </button>
-          <button
-            type="button"
-            class="col-start-3 row-start-1 rounded-lg bg-accent-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-accent-500 disabled:opacity-45"
-            onclick={() => doPlay(false)}
-            disabled={!canPlay}
-          >
-            {playingOp === "play" ? "Opening…" : "Play"}
-          </button>
         </div>
+        <button
+          type="button"
+          class="shrink-0 rounded-lg border border-accent-600 bg-accent-600 px-4 py-2 text-white shadow hover:bg-accent-500 disabled:opacity-45"
+          disabled={!canPlay}
+          onclick={() => doPlay(false)}
+          aria-label="Play"
+          title="Open in VLC (Enter)"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            class="h-5 w-5"
+            aria-hidden="true"
+          >
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        </button>
       </div>
       {#if title.trim()}
         <p class="mt-1.5 truncate text-[11px] text-surface-400" title={title.trim()}>
@@ -1098,7 +1150,6 @@
     </section>
 
     <StreamProxies
-      bind:this={proxiesRef}
       {streams}
       onStopStream={(id) => void stopStream(id)}
       onSeekStream={(id, seg) => void seekStream(id, seg)}

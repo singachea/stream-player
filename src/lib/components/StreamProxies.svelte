@@ -16,11 +16,6 @@
       : [...expanded, id];
   }
 
-  /** Open one stream's detail grid; called when a new stream appears. */
-  export function expand(id: number) {
-    if (!expanded.includes(id)) expanded = [...expanded, id];
-  }
-
   function fmtBytes(n: number) {
     if (!n) return "—";
     if (n < 1024) return `${n} B`;
@@ -94,16 +89,6 @@
         >
       {/if}
     </h2>
-    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-surface-500">
-      {#each ["downloading", "buffered", "error", "idle"] as st (st)}
-        <span class="flex items-center gap-1" title={statusHint[st]}>
-          <span
-            class="inline-block h-1.5 w-1.5 rounded-full {statusDot[st]}"
-          ></span>
-          {st}
-        </span>
-      {/each}
-    </div>
   </div>
   {#if streams.length === 0}
     <p class="mt-1 text-xs text-surface-500">
@@ -115,8 +100,9 @@
         <thead>
           <tr class="text-surface-500">
             <th class="px-2 py-1 font-medium">Stream</th>
-            <th class="px-2 py-1 font-medium">Port</th>
+            <th class="px-2 py-1 font-medium">Quality</th>
             <th class="px-2 py-1 font-medium" title="Segments held in cache">Size</th>
+            <th class="px-2 py-1 font-medium" title="Blocks ready for VLC">Ready</th>
             <th class="px-2 py-1 font-medium" title="Upstream bytes/sec, trailing 10s">Speed</th>
             <th class="px-2 py-1 font-medium">Status</th>
             <th class="px-2 py-1"><span class="sr-only">Actions</span></th>
@@ -124,6 +110,7 @@
         </thead>
         <tbody>
           {#each streams as s (s.id)}
+            {@const have = cachedSet(s)}
             <tr class="border-t border-surface-800">
               <td
                 class="max-w-48 truncate px-2 py-1.5 font-mono text-surface-100"
@@ -132,10 +119,13 @@
                 {streamName(s)}
               </td>
               <td class="px-2 py-1.5 font-mono text-surface-300">
-                {s.port ?? "—"}
+                {s.quality}
               </td>
               <td class="px-2 py-1.5 font-mono text-surface-300">
                 {fmtSizeMB(s.cachedBytes)}
+              </td>
+              <td class="px-2 py-1.5 font-mono text-surface-300">
+                {#if s.total}{have.size}/{s.total}{:else}—{/if}
               </td>
               <td class="px-2 py-1.5 font-mono text-surface-300">
                 {fmtSpeed(s.speedBps)}
@@ -172,9 +162,37 @@
                 </button>
               </td>
             </tr>
+            {#if s.total}
+              <tr class="border-t border-surface-800">
+                <td colspan={7} class="px-3 py-2">
+                  <div
+                    class="flex flex-wrap items-center gap-px"
+                    role="img"
+                    aria-label={`${have.size} of ${s.total} blocks ready`}
+                  >
+                    {#each Array(s.total) as _, n (n)}
+                      {@const playing = s.playhead === n}
+                      <button
+                        type="button"
+                        class="h-2.5 w-2.5 cursor-pointer rounded-[2px] {playing
+                          ? 'seg-playhead'
+                          : have.has(n)
+                            ? 'bg-accent-500'
+                            : 'bg-surface-800'}"
+                        title={playing
+                          ? `seg ${n} playing — click to replay from here`
+                          : `seg ${n}${have.has(n) ? " cached" : ""} — click to jump VLC here`}
+                        aria-label={`Jump VLC to segment ${n}`}
+                        onclick={() => onSeekStream(s.id, n)}
+                      ></button>
+                    {/each}
+                  </div>
+                </td>
+              </tr>
+            {/if}
             {#if expanded.includes(s.id)}
               <tr class="border-t border-surface-800 bg-surface-850/50">
-                <td colspan={6} class="px-3 py-2.5">
+                <td colspan={7} class="px-3 py-2.5">
                   <dl class="grid gap-x-6 gap-y-1.5 text-[11px] sm:grid-cols-2">
                     <div class="min-w-0">
                       <dt class="text-surface-500">Remote URL</dt>
@@ -213,43 +231,6 @@
                       </dd>
                     </div>
                   </dl>
-                  {#if s.total}
-                    {@const have = cachedSet(s)}
-                    <p class="mt-2 text-[11px] text-surface-500">
-                      Segment cache: {have.size}/{s.total} downloaded
-                      <span class="ml-2">
-                        <span
-                          class="mr-1 inline-block h-2 w-2 rounded-[2px] align-[-1px] seg-playhead"
-                        ></span>playing
-                      </span>
-                    </p>
-                    <div
-                      class="mt-1.5 flex flex-wrap gap-px"
-                      role="img"
-                      aria-label={`${have.size} of ${s.total} segments cached`}
-                    >
-                      {#each Array(s.total) as _, n (n)}
-                        {@const playing = s.playhead === n}
-                        <button
-                          type="button"
-                          class="h-2.5 w-2.5 cursor-pointer rounded-[2px] {playing
-                            ? 'seg-playhead'
-                            : have.has(n)
-                              ? 'bg-accent-500'
-                              : 'bg-surface-800'}"
-                          title={playing
-                            ? `seg ${n} playing — click to replay from here`
-                            : `seg ${n}${have.has(n) ? " cached" : ""} — click to jump VLC here`}
-                          aria-label={`Jump VLC to segment ${n}`}
-                          onclick={() => onSeekStream(s.id, n)}
-                        ></button>
-                      {/each}
-                    </div>
-                  {:else}
-                    <p class="mt-2 text-[11px] text-surface-500">
-                      No segment map for this session (progressive file).
-                    </p>
-                  {/if}
                   {#if s.lastError}
                     <p class="mt-1.5 break-all font-mono text-[11px] text-danger-400">
                       Last error: {s.lastError}
@@ -262,11 +243,6 @@
         </tbody>
       </table>
     </div>
-    <p class="mt-2 text-[11px] leading-4 text-surface-500">
-      Size is segments held in cache; speed is upstream bytes/sec over the
-      trailing 10s. Buffered means idle with the readahead window full.
-      Click a block to jump VLC to that segment without restarting it.
-    </p>
   {/if}
 </section>
 
