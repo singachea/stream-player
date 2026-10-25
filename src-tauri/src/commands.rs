@@ -21,8 +21,8 @@ use crate::hls::{
     parse_subtitle_tracks, parse_variants, ranked_variants, subtitle_label, variant_label, Variant,
 };
 use crate::player::{
-    rc_seek, spawn_vlc, start_hls_playback, start_http_playback, vlc_path, vlc_stderr_level,
-    wait_for_vlc,
+    rc_length, rc_seek, spawn_vlc, start_hls_playback, start_http_playback, vlc_path,
+    vlc_stderr_level, wait_for_vlc,
 };
 use crate::prefs::{
     host_of, load_prefs, normalize_referer, prefs_path, remember_prefs, save_prefs, settings_for,
@@ -165,12 +165,87 @@ impl StreamSession {
     }
 }
 
-fn dto_from_snap(snap: &StreamSnap) -> StreamDto {
+/// Non-blocking proxy read for UI-thread DTOs. A wedged proxy degrades to
+/// a retryable miss instead of beachballing the poll: the next tick retries.
+/// Contention is reported on the terminal (captured, not shown, under
+/// `cargo test`), and poisoned state is recovered like the tracked lock.
+fn proxy_guard(snap: &StreamSnap) -> Option<std::sync::MutexGuard<'_, ProxyState>> {
+    let state = snap.proxy_state.as_ref()?;
+    match state.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            eprintln!("play: proxy busy, retrying stream {}", snap.id);
+            None
+        }
+    }
+}
+
+/// DTO for progressive-file sessions: the grid renders on-disk pieces, so
+/// green means available locally like cached HLS segments. One brief proxy
+/// section; never nested under streams.
+fn file_session_dto(snap: &StreamSnap, now: u64) -> Option<StreamDto> {
+    let st = proxy_guard(snap)?;
+    let total = st.total_bytes.unwrap_or(0);
+    let playhead = st.file_seek_chunk.or_else(|| {
+        st.served_cur_byte
+            .and_then(|off| crate::proxy::file_playhead_chunk(total, off))
+    });
+    let window = st.cached_cells.to_vec();
+    let mut buffered = 0;
+    while buffered < window.len() && window[buffered] {
+        buffered += 1;
+    }
+    let cached: Vec<usize> = window
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c)
+        .map(|(i, _)| i)
+        .collect();
+    let fetch_status = crate::proxy::fetch_status(
+        crate::proxy::FILE_CHUNKS,
+        buffered,
+        crate::proxy::FILE_CHUNKS,
+        st.fetch_inflight,
+        st.last_ok_ms,
+        st.last_error_ms,
+        now,
+    );
+    Some(StreamDto {
+        id: snap.id,
+        url: snap.url.clone(),
+        host: host_of(&snap.url),
+        quality: snap.quality.clone(),
+        status: snap.status.clone(),
+        title: snap.title.clone(),
+        local_url: snap.play_url.clone(),
+        port: snap.proxy_base.as_deref().and_then(port_of),
+        fetch_status: fetch_status.to_string(),
+        speed_bps: crate::proxy::recent_speed_bps(&st.recent, now),
+        fetched_bytes: st.fetched_bytes,
+        last_error: st.last_error.clone(),
+        cached,
+        pid: snap.pid,
+        playhead,
+        buffered,
+        window,
+        window_start: Some(0),
+        window_len: crate::proxy::FILE_CHUNKS,
+        total: crate::proxy::FILE_CHUNKS,
+        cached_bytes: st.cached_bytes,
+        served: st.served_count,
+    })
+}
+
+fn dto_from_snap(snap: &StreamSnap) -> Option<StreamDto> {
     let now = now_ms();
+    if proxy_guard(snap).is_some_and(|st| st.source.is_some()) {
+        return file_session_dto(snap, now);
+    }
     let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
         match &snap.proxy_state {
-            Some(state) => {
-                let st = state.lock().unwrap();
+            Some(_) => {
+                let st = proxy_guard(snap)?;
                 let total = st.segments.len();
                 let playhead = st.served_cur;
                 // Contiguous cached run ahead of the playhead. Sparse
@@ -211,8 +286,8 @@ fn dto_from_snap(snap: &StreamSnap) -> StreamDto {
         };
     let (port, fetch_status, speed_bps, fetched_bytes, last_error, cached) =
         match &snap.proxy_state {
-            Some(state) => {
-                let st = state.lock().unwrap();
+            Some(_) => {
+                let st = proxy_guard(snap)?;
                 let status = crate::proxy::fetch_status(
                     total,
                     buffered,
@@ -236,7 +311,7 @@ fn dto_from_snap(snap: &StreamSnap) -> StreamDto {
             }
             None => (None, "idle".to_string(), None, 0, None, Vec::new()),
         };
-    StreamDto {
+    Some(StreamDto {
         id: snap.id,
         url: snap.url.clone(),
         host: host_of(&snap.url),
@@ -259,7 +334,7 @@ fn dto_from_snap(snap: &StreamSnap) -> StreamDto {
         total,
         cached_bytes,
         served,
-    }
+    })
 }
 
 fn emit_stream(app: &AppHandle, dto: &StreamDto) {
@@ -488,7 +563,7 @@ fn patch_stream(app: &AppHandle, id: u64, f: impl FnOnce(&mut StreamSession)) ->
         f(s);
         s.snapshot()
     };
-    Some(dto_from_snap(&snap))
+    dto_from_snap(&snap)
 }
 
 #[derive(Clone, Serialize)]
@@ -1594,7 +1669,7 @@ pub fn list_streams_cmd(state: State<AppState>) -> Result<Vec<StreamDto>, String
         })?;
         streams.values().map(|s| s.snapshot()).collect()
     };
-    Ok(snaps.iter().map(dto_from_snap).collect())
+    Ok(snaps.iter().filter_map(dto_from_snap).collect())
 }
 
 #[tauri::command]
@@ -1673,27 +1748,64 @@ fn seek_blocking(app: &AppHandle, id: u64, seg: usize) -> Result<StreamDto, Stri
     let proxy_state = proxy_state
         .as_ref()
         .ok_or_else(|| format!("play: stream {id} has no proxy"))?;
-    let playlist = {
-        let pst = proxy_state.lock().unwrap();
-        if seg >= pst.segments.len() {
-            return Err(format!(
-                "play: segment {seg} out of range (total {})",
-                pst.segments.len()
-            ));
+    let (is_file, playlist) = {
+        let pst = proxy_state
+            .try_lock()
+            .map_err(|_| format!("play: proxy busy, retrying seek {id}"))?;
+        if pst.source.is_some() {
+            // Progressive file: fixed virtual chunks, no playlist math.
+            if seg >= crate::proxy::FILE_CHUNKS {
+                return Err(format!(
+                    "play: chunk {seg} out of range (total {})",
+                    crate::proxy::FILE_CHUNKS
+                ));
+            }
+            (true, Vec::new())
+        } else {
+            if seg >= pst.segments.len() {
+                return Err(format!(
+                    "play: segment {seg} out of range (total {})",
+                    pst.segments.len()
+                ));
+            }
+            (false, pst.playlist.clone())
         }
-        pst.playlist.clone()
     };
     if let Some(port) = rc_port {
-        let secs = crate::proxy::seg_offset_secs(&playlist, seg) as u64;
+        // File sessions seek by time fraction: chunk N of 20 across the
+        // RC-reported duration. HLS sums EXTINF durations instead.
+        let secs = if is_file {
+            let dur = rc_length(port).map_err(err_str)?;
+            seg as u64 * dur / crate::proxy::FILE_CHUNKS as u64
+        } else {
+            crate::proxy::seg_offset_secs(&playlist, seg) as u64
+        };
         match rc_seek(port, secs) {
             Ok(()) => {
                 // Stand down any stale fill window at once; the new window
                 // starts filling on the next serve. Show the target until
                 // serving confirms arrival. Proxy-only section (the map
                 // lookup updated nothing): no streams guard, so a slow
-                // proxy cannot wedge the map from the seek path.
-                {
-                    let mut pst = proxy_state.lock().unwrap();
+                // proxy cannot wedge the map from the seek path. File
+                // sessions record the sought chunk itself: the seek knows
+                // its fraction exactly, serve traffic only approximates it.
+                if is_file {
+                    {
+                        let mut pst = proxy_state
+                            .try_lock()
+                            .map_err(|_| format!("play: proxy busy, retrying seek {id}"))?;
+                        pst.file_seek_chunk = Some(seg);
+                        // Bump the prefetch epoch under the same section so
+                        // an older warm cannot outlive this seek.
+                        pst.fetch_epoch = pst.fetch_epoch.wrapping_add(1);
+                    }
+                    // Outside the guard: the warm snapshots what it needs
+                    // and never touches the mutex while fetching.
+                    crate::proxy::prefetch_file_around(proxy_state, seg);
+                } else {
+                    let mut pst = proxy_state
+                        .try_lock()
+                        .map_err(|_| format!("play: proxy busy, retrying seek {id}"))?;
                     pst.fetch_epoch += 1;
                     pst.served_cur = seg.checked_sub(1);
                 }
@@ -1713,6 +1825,13 @@ fn seek_blocking(app: &AppHandle, id: u64, seg: usize) -> Result<StreamDto, Stri
             }
         }
     }
+    // Progressive files have no relaunch seek target: restarting at 0
+    // would lie about position, so a missing control channel is an error.
+    if is_file {
+        return Err(format!(
+            "play: seek stream {id}: remote control unavailable"
+        ));
+    }
     let sep = if play_url.contains('?') { '&' } else { '?' };
     let target = format!("{play_url}{sep}from={seg}");
     let mut args = sub_args;
@@ -1725,7 +1844,10 @@ fn seek_blocking(app: &AppHandle, id: u64, seg: usize) -> Result<StreamDto, Stri
     // Proxy first, map second: flat sections, never nested. Show the
     // target immediately; serving updates it as VLC arrives.
     {
-        proxy_state.lock().unwrap().served_cur = seg.checked_sub(1);
+        let mut pst = proxy_state
+            .try_lock()
+            .map_err(|_| format!("play: proxy busy, retrying seek {id}"))?;
+        pst.served_cur = seg.checked_sub(1);
     }
     {
         let mut streams = st.streams.lock(StreamsSite::SeekUpdate);
@@ -2262,6 +2384,59 @@ mod tests {
             assert_eq!(site, "Reap");
             entered.wait();
         });
+    }
+
+    #[test]
+    fn test_dto_skips_wedged_proxy_without_blocking() {
+        use std::sync::Arc;
+        let state = Arc::new(crate::proxy::tests::blank_state(Vec::new(), 0));
+        let snap = StreamSnap {
+            id: 7,
+            url: "https://cdn.example/f".to_string(),
+            quality: "best".to_string(),
+            status: "playing".to_string(),
+            title: None,
+            play_url: "http://127.0.0.1:1/f.mp4".to_string(),
+            pid: None,
+            proxy_state: Some(state.clone()),
+            proxy_base: None,
+        };
+        // Free proxy: DTO present on both branches (blank state starts
+        // sourceless, so the first pass takes the HLS path).
+        assert!(dto_from_snap(&snap).is_some());
+        state.lock().unwrap().source = Some("file".to_string());
+        assert!(file_session_dto(&snap, 0).is_some());
+        // Held proxy: retryable miss on both branches, never parks.
+        let _held = state.lock().unwrap();
+        assert!(dto_from_snap(&snap).is_none());
+        assert!(file_session_dto(&snap, 0).is_none());
+    }
+
+    #[test]
+    fn test_file_dto_renders_cached_cells() {
+        use std::sync::Arc;
+        let state = Arc::new(crate::proxy::tests::blank_state(Vec::new(), 0));
+        let snap = StreamSnap {
+            id: 9,
+            url: "https://cdn.example/f".to_string(),
+            quality: "best".to_string(),
+            status: "playing".to_string(),
+            title: None,
+            play_url: "http://127.0.0.1:1/f.mp4".to_string(),
+            pid: None,
+            proxy_state: Some(state.clone()),
+            proxy_base: None,
+        };
+        // Sourceless sessions take the HLS branch; the file grid needs one.
+        state.lock().unwrap().source = Some("file".to_string());
+        state.lock().unwrap().cached_cells[7] = true;
+        let dto = file_session_dto(&snap, 0).expect("dto");
+        // Green means on disk: only the recorded cell lights, served spans
+        // alone (none here) light nothing.
+        assert!(dto.window[7]);
+        assert!(!dto.window[6]);
+        assert!(!dto.window[8]);
+        assert_eq!(dto.buffered, 0);
     }
 
     #[test]

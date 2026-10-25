@@ -76,6 +76,60 @@ pub fn rc_seek(port: u16, secs: u64) -> Result<()> {
     Err(Error::msg(format!("play: rc seek 127.0.0.1:{port}: {last}")))
 }
 
+/// Media duration in seconds via `get_length`. Drains pre-command chatter,
+/// then takes the first bare-number reply line. Bounded (~3s per attempt);
+/// callers run off the main thread.
+pub fn rc_length(port: u16) -> Result<u64> {
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| Error::msg(format!("play: bad rc addr: {e}")))?;
+    let mut last = "unreachable".to_string();
+    for _ in 0..2 {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+            Ok(mut stream) => {
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut rd = BufReader::new(stream.try_clone().map_err(|e| {
+                    Error::msg(format!("play: rc length 127.0.0.1:{port}: {e}"))
+                })?);
+                // Drain status broadcasts so the reply is unambiguous.
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match rd.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                if stream.write_all(b"get_length\n").is_err() {
+                    last = "write failed".to_string();
+                } else {
+                    let _ = stream.flush();
+                    line.clear();
+                    loop {
+                        line.clear();
+                        match rd.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if let Ok(v) = line.trim().parse::<u64>() {
+                                    return Ok(v);
+                                }
+                            }
+                        }
+                    }
+                    last = "no length reply".to_string();
+                }
+            }
+            Err(e) => last = e.to_string(),
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(Error::msg(format!(
+        "play: rc length 127.0.0.1:{port}: {last}"
+    )))
+}
+
 pub fn vlc_launch_args(vlc: &Path, media_args: &[&str]) -> Vec<String> {
     let mut cmd = vec![
         vlc.to_string_lossy().into_owned(),
@@ -567,6 +621,16 @@ pub fn start_http_playback(
             }
         }
         proxy.state.lock().unwrap().files = files;
+    }
+    // Publish the immutable routing snapshot: serving reads it without the
+    // mutex from here on. Setup-time only; no request has arrived yet.
+    {
+        let st = proxy.state.lock().unwrap();
+        let _ = proxy.file_route.set(crate::proxy::FileRoute {
+            source: st.source.clone(),
+            files: st.files.clone(),
+            headers: headers.clone(),
+        });
     }
     if verbose {
         eprintln!("play: local file {local}");
