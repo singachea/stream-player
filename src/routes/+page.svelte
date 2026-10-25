@@ -22,7 +22,7 @@
   import StreamProxies from "$lib/components/StreamProxies.svelte";
   import JobsPane from "$lib/components/JobsPane.svelte";
   import SettingsPane from "$lib/components/SettingsPane.svelte";
-  import StreamsPane from "$lib/components/StreamsPane.svelte";
+
 
   let url = $state("");
   let title = $state("");
@@ -807,10 +807,6 @@
 
   {#if tab === "player"}
   <main class="flex min-h-0 flex-1">
-    <StreamsPane
-      {streams}
-      onStop={(id) => void stopStream(id)}
-    />
     <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-auto p-4">
     <section class="rounded-xl border border-surface-800 bg-surface-900 p-4">
       <div class="flex items-center justify-between gap-2">
