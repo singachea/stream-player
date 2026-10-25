@@ -181,9 +181,9 @@ fn proxy_guard(snap: &StreamSnap) -> Option<std::sync::MutexGuard<'_, ProxyState
     }
 }
 
-/// DTO for progressive-file sessions: the grid renders on-disk pieces, so
-/// green means available locally like cached HLS segments. One brief proxy
-/// section; never nested under streams.
+/// DTO for progressive-file sessions: the grid renders served spans, so
+/// green means streamed to VLC before. Files stream without a disk cache.
+/// One brief proxy section; never nested under streams.
 fn file_session_dto(snap: &StreamSnap, now: u64) -> Option<StreamDto> {
     let st = proxy_guard(snap)?;
     let total = st.total_bytes.unwrap_or(0);
@@ -191,7 +191,7 @@ fn file_session_dto(snap: &StreamSnap, now: u64) -> Option<StreamDto> {
         st.served_cur_byte
             .and_then(|off| crate::proxy::file_playhead_chunk(total, off))
     });
-    let window = st.cached_cells.to_vec();
+    let window = crate::proxy::served_cells(total, &st.served_ranges);
     let mut buffered = 0;
     while buffered < window.len() && window[buffered] {
         buffered += 1;
@@ -1795,13 +1795,7 @@ fn seek_blocking(app: &AppHandle, id: u64, seg: usize) -> Result<StreamDto, Stri
                             .try_lock()
                             .map_err(|_| format!("play: proxy busy, retrying seek {id}"))?;
                         pst.file_seek_chunk = Some(seg);
-                        // Bump the prefetch epoch under the same section so
-                        // an older warm cannot outlive this seek.
-                        pst.fetch_epoch = pst.fetch_epoch.wrapping_add(1);
                     }
-                    // Outside the guard: the warm snapshots what it needs
-                    // and never touches the mutex while fetching.
-                    crate::proxy::prefetch_file_around(proxy_state, seg);
                 } else {
                     let mut pst = proxy_state
                         .try_lock()
@@ -2429,10 +2423,14 @@ mod tests {
         };
         // Sourceless sessions take the HLS branch; the file grid needs one.
         state.lock().unwrap().source = Some("file".to_string());
-        state.lock().unwrap().cached_cells[7] = true;
+        // Served span 140-160 of 2000 bytes lands in cell 7 alone.
+        {
+            let mut st = state.lock().unwrap();
+            st.total_bytes = Some(2000);
+            st.served_ranges.push((140, 160));
+        }
         let dto = file_session_dto(&snap, 0).expect("dto");
-        // Green means on disk: only the recorded cell lights, served spans
-        // alone (none here) light nothing.
+        // Green means streamed before: only the served cell lights.
         assert!(dto.window[7]);
         assert!(!dto.window[6]);
         assert!(!dto.window[8]);

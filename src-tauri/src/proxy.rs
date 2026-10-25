@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::fs::File;
-use std::io::{Cursor, Seek};
-use std::path::{Path, PathBuf};
+use std::io::Cursor;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,12 +28,11 @@ pub struct ProxyState {
     /// Highest segment index VLC has requested. Kept for stats only.
     pub served_max: Option<usize>,
     /// Byte spans served to VLC by the progressive-file proxy (start
-    /// inclusive, end exclusive). Kept for diagnostics; the grid renders
-    /// `cached_cells` instead so green means on-disk like HLS. Bounded.
+    /// inclusive, end exclusive). The file grid renders these cells, so
+    /// green means streamed before. Bounded.
     pub served_ranges: Vec<(u64, u64)>,
-    /// File grid cells whose bytes sit on disk (fetched, warmed, or
-    /// pre-read). Rendered directly by the file DTO: green means available
-    /// locally, matching cached HLS segments.
+    /// Unused by the streaming file proxy; kept so the file DTO shape and
+    /// HLS grid rendering stay unchanged.
     pub cached_cells: [bool; FILE_CHUNKS],
     /// Start offset of the most recently served file span: fallback MP4
     /// playhead before any seek (e.g. initial playback from byte 0).
@@ -163,38 +161,6 @@ pub fn port_of(base: &str) -> Option<u16> {
 /// renders this many cells with no frontend changes.
 pub(crate) const FILE_CHUNKS: usize = 100;
 
-/// Mark one disk-complete piece visible on the file grid: only cells whose
-/// first byte (the seek landing point) the piece contains. A cell is green
-/// only when seeking there starts instantly, matching the HLS grid where
-/// green means cached segments. In particular a trailing `moov` probe piece
-/// lights nothing: seeking the last cell still needs its first bytes.
-/// Best-effort: a wedged proxy only dims the grid, never stalls.
-pub(crate) fn record_piece_cell(state: &Mutex<ProxyState>, total: u64, idx: u64) {
-    if total == 0 {
-        return;
-    }
-    let (pstart, plen) = file_piece_span(total, idx);
-    if plen == 0 {
-        return;
-    }
-    // First cell whose first byte sits at or after `off`, unclamped so a
-    // past-the-end piece compares empty instead of clamping onto cell 99.
-    let first_cell_from = |off: u64| {
-        (off.saturating_mul(FILE_CHUNKS as u64).saturating_add(total - 1) / total) as usize
-    };
-    let (lo, hi) = (
-        first_cell_from(pstart),
-        first_cell_from(pstart + plen).saturating_sub(1),
-    );
-    if lo <= hi {
-        if let Ok(mut st) = state.try_lock() {
-            for c in lo.min(FILE_CHUNKS - 1)..=hi.min(FILE_CHUNKS - 1) {
-                st.cached_cells[c] = true;
-            }
-        }
-    }
-}
-
 /// Resolve a served response to a `(start, end_exclusive, total)` byte span
 /// for chunk display. `range` is the request's Range value, `code`/`clen`
 /// the upstream status and length, `crange` its Content-Range value.
@@ -271,6 +237,28 @@ pub(crate) fn try_note_file_served(
         st.served_ranges.remove(0);
     }
     true
+}
+
+/// Map served byte spans onto file grid cells. Lit cells were streamed
+/// to VLC before; with no disk cache this is the honest file-grid
+/// signal. Best-effort like every other progress mark.
+pub(crate) fn served_cells(total: u64, spans: &[(u64, u64)]) -> Vec<bool> {
+    let mut cells = vec![false; FILE_CHUNKS];
+    if total == 0 {
+        return cells;
+    }
+    for &(s, e) in spans {
+        if e <= s {
+            continue;
+        }
+        let lo = (s.saturating_mul(FILE_CHUNKS as u64) / total) as usize;
+        let hi =
+            (e.saturating_sub(1).saturating_mul(FILE_CHUNKS as u64) / total) as usize;
+        for c in lo.min(FILE_CHUNKS - 1)..=hi.min(FILE_CHUNKS - 1) {
+            cells[c] = true;
+        }
+    }
+    cells
 }
 
 fn now_ms() -> u64 {
@@ -1143,432 +1131,6 @@ impl<R> Drop for ServeCounter<R> {
     }
 }
 
-/// Read-through extent cache for progressive files: 1 MiB pieces as files,
-/// complete via atomic rename (presence = complete, crash-safe by
-/// construction). Concurrent same-piece fetches may duplicate work but
-/// never corrupt: temp names are unique, renames last-wins identical bytes.
-pub(crate) const FILE_PIECE: u64 = 1024 * 1024;
-/// How many content dirs the cache keeps; oldest beyond this is pruned.
-pub(crate) const FILE_CACHE_MAX_CONTENTS: usize = 4;
-
-fn fnv1a64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// Stable cache key for a (possibly signed, rotating-token) file URL:
-/// host plus path with the query and any per-issue `~signature` tail
-/// stripped. Degenerate paths fall back to the full query-less URL so the
-/// key never collapses to host-only. Misses are the safe direction.
-pub(crate) fn file_cache_key(url: &str) -> String {
-    let no_query = url.split('?').next().unwrap_or(url);
-    let after_scheme = no_query.split("://").nth(1).unwrap_or(no_query);
-    let slash = after_scheme.find('/').unwrap_or(after_scheme.len());
-    let (host, path) = after_scheme.split_at(slash);
-    let stable = path.split('~').next().unwrap_or(path);
-    let keyed = if stable.len() < 8 { no_query } else { stable };
-    format!("{:016x}", fnv1a64(&format!("{host}{keyed}")))
-}
-
-pub(crate) fn file_cache_root() -> PathBuf {
-    std::env::temp_dir().join("play-file-cache")
-}
-
-/// Piece index holding a byte offset; (start, expected_len) of a piece.
-pub(crate) fn file_piece_index(offset: u64) -> u64 {
-    offset / FILE_PIECE
-}
-
-pub(crate) fn file_piece_span(total: u64, idx: u64) -> (u64, u64) {
-    let start = idx.saturating_mul(FILE_PIECE);
-    let len = total.saturating_sub(start).min(FILE_PIECE);
-    (start, len)
-}
-
-/// Requested (start, end-exclusive) byte span from a Range value against a
-/// known total, clamped into range. Full requests map the whole file.
-/// Unparseable or out-of-range spans return None: serve streaming instead.
-pub(crate) fn parse_request_span(range: Option<&str>, total: u64) -> Option<(u64, u64)> {
-    if total == 0 {
-        return None;
-    }
-    match range.and_then(|r| r.strip_prefix("bytes=")) {
-        Some(rest) => {
-            let (a, b) = rest.split_once('-')?;
-            let start: u64 = a.trim().parse().ok()?;
-            let mut end = if b.trim().is_empty() {
-                total
-            } else {
-                b.trim().parse::<u64>().ok()?.saturating_add(1)
-            };
-            end = end.min(total);
-            if end <= start || start >= total {
-                return None;
-            }
-            Some((start, end))
-        }
-        None => Some((0, total)),
-    }
-}
-
-/// Pure LRU choice: which cached contents to drop, oldest first, never the
-/// live one. Tested; the fs walk feeding it is not.
-pub(crate) fn dirs_to_prune(
-    mut entries: Vec<(PathBuf, std::time::SystemTime)>,
-    live: &Path,
-    cap: usize,
-) -> Vec<PathBuf> {
-    entries.retain(|(p, _)| p != live);
-    entries.sort_by_key(|(_, t)| *t);
-    let drop = entries.len().saturating_sub(cap.saturating_sub(1));
-    entries.into_iter().take(drop).map(|(p, _)| p).collect()
-}
-
-#[derive(Clone)]
-pub(crate) struct FileCache {
-    dir: PathBuf,
-    total: u64,
-    ctype: String,
-}
-
-impl FileCache {
-    /// Open (creating) the cache for one content id. Records the content
-    /// type when known, prunes other contents past the cap. None on fs
-    /// failure: callers fall back to pass-through streaming.
-    pub(crate) fn open(url: &str, total: u64, ctype: Option<&str>) -> Option<Self> {
-        let dir = file_cache_root().join(file_cache_key(url));
-        if fs::create_dir_all(&dir).is_err() {
-            return None;
-        }
-        if let Some(ct) = ctype {
-            let marker = dir.join("ctype");
-            if !marker.exists() {
-                let _ = fs::write(&marker, ct.as_bytes().get(..128).unwrap_or(ct.as_bytes()));
-            }
-        }
-        // Best-effort LRU prune of other contents.
-        if let Ok(rd) = fs::read_dir(file_cache_root()) {
-            let mut entries = Vec::new();
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if let Ok(m) = fs::metadata(&p).and_then(|m| m.modified()) {
-                        entries.push((p, m));
-                    }
-                }
-            }
-            for old in dirs_to_prune(entries, &dir, FILE_CACHE_MAX_CONTENTS) {
-                let _ = fs::remove_dir_all(old);
-            }
-        }
-        let ctype = fs::read(dir.join("ctype"))
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "video/mp4".to_string());
-        Some(Self { dir, total, ctype })
-    }
-
-    fn part_path(&self, idx: u64) -> PathBuf {
-        self.dir.join(format!("{idx:08}.part"))
-    }
-}
-
-/// Fetch one exact byte span upstream into a temp file. Rejects short,
-/// long, and non-2xx answers: a wrong-sized part must never complete.
-fn fetch_piece_to_file(
-    url: &str,
-    headers: &HashMap<String, String>,
-    start: u64,
-    len: u64,
-    dest_tmp: &Path,
-) -> std::result::Result<(), String> {
-    let end = start.saturating_add(len).saturating_sub(1);
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-sS",
-        "--http1.1",
-        "-L",
-        "--max-redirs",
-        "10",
-        "--max-time",
-        "30",
-        "--max-filesize",
-        &len.to_string(),
-        "-r",
-        &format!("{start}-{end}"),
-        "-o",
-        dest_tmp.to_str().unwrap_or("part"),
-        "-w",
-        "%{http_code}",
-    ]);
-    for (k, v) in headers {
-        if crate::fetch::omit_curl_header(k, v, url, headers) {
-            continue;
-        }
-        cmd.arg("-H").arg(format!("{k}: {v}"));
-    }
-    curl_push_url(&mut cmd, url);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .map_err(|e| format!("play: cache fetch spawn failed: {e}"))?;
-    if !out.status.success() {
-        let _ = fs::remove_file(dest_tmp);
-        return Err(format!("play: cache fetch curl failed"));
-    }
-    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let size = fs::metadata(dest_tmp).map(|m| m.len()).unwrap_or(u64::MAX);
-    if (code == "206" || code == "200") && size == len {
-        Ok(())
-    } else {
-        let _ = fs::remove_file(dest_tmp);
-        Err(format!("play: cache fetch HTTP {code} size {size}/{len}"))
-    }
-}
-
-static PIECE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Serves one requested span piece by piece: cache hits read from disk,
-/// misses range-fetch upstream then complete atomically. Blocking fetches
-/// run in serve threads (no locks held); VLC aborts orphan at most one
-/// bounded fetch per in-flight piece.
-pub(crate) struct CacheReader<F> {
-    cache: FileCache,
-    url: String,
-    headers: HashMap<String, String>,
-    fetch: F,
-    cursor: u64,
-    end: u64,
-    cur: Option<(File, u64)>,
-    /// Miss callback with the piece index, so the serve path can warm
-    /// coming pieces. `None` in tests and anywhere without readahead.
-    on_miss: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    /// Disk-complete callback with the piece index, so the file grid can
-    /// light cached cells. Fires on hits and misses alike. `None` in tests.
-    on_cached: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-}
-
-impl<F> CacheReader<F>
-where
-    F: Fn(
-        &str,
-        &HashMap<String, String>,
-        u64,
-        u64,
-        &Path,
-    ) -> std::result::Result<(), String>,
-{
-    pub(crate) fn new(
-        cache: FileCache,
-        url: String,
-        headers: HashMap<String, String>,
-        fetch: F,
-        start: u64,
-        end: u64,
-        on_miss: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-        on_cached: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    ) -> Self {
-        Self {
-            cache,
-            url,
-            headers,
-            fetch,
-            cursor: start,
-            end,
-            cur: None,
-            on_miss,
-            on_cached,
-        }
-    }
-
-    fn record_cached(&self, idx: u64) {
-        if let Some(cb) = &self.on_cached {
-            cb(idx);
-        }
-    }
-
-    fn ensure_piece(&self, idx: u64) -> std::io::Result<File> {
-        let (pstart, plen) = file_piece_span(self.cache.total, idx);
-        let path = self.cache.part_path(idx);
-        match fs::metadata(&path) {
-            Ok(m) if m.len() == plen => {
-                self.record_cached(idx);
-                return File::open(path).map_err(other_err);
-            }
-            Ok(_) => {
-                let _ = fs::remove_file(&path);
-            }
-            Err(_) => {}
-        }
-        let tmp = self.cache.dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            PIECE_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        (self.fetch)(&self.url, &self.headers, pstart, plen, &tmp)
-            .map_err(|e| std::io::Error::other(e))?;
-        fs::rename(&tmp, &path).map_err(other_err)?;
-        self.record_cached(idx);
-        File::open(&path).map_err(other_err)
-    }
-
-    /// Fetch the piece holding `offset` when missing. Serve paths call this
-    /// before committing to a cache response: a range-ignoring or dead
-    /// upstream must fall back to streaming, never truncate VLC mid-body.
-    pub(crate) fn prewarm(&self, offset: u64) -> std::io::Result<()> {
-        self.ensure_piece(file_piece_index(offset)).map(|_| ())
-    }
-}
-
-/// A piece file is complete when present at exactly its expected length.
-/// Zero-length tails are never complete: there is nothing to fetch.
-pub(crate) fn piece_complete(cache: &FileCache, idx: u64) -> bool {
-    let (_, plen) = file_piece_span(cache.total, idx);
-    plen > 0 && fs::metadata(cache.part_path(idx)).map(|m| m.len() == plen).unwrap_or(false)
-}
-
-/// Warm explicit byte offsets through any fetch backend. Stops at the
-/// total; per-piece completion is atomic, so interrupted warms simply miss
-/// again later. Returns the warmed piece indexes so callers can light the
-/// grid. Never touches the proxy mutex.
-pub(crate) fn warm_pieces<F>(
-    cache: &FileCache,
-    url: &str,
-    headers: &HashMap<String, String>,
-    fetch: F,
-    offsets: &[u64],
-) -> Vec<u64>
-where
-    F: Fn(&str, &HashMap<String, String>, u64, u64, &Path) -> std::result::Result<(), String>,
-{
-    let reader = CacheReader::new(
-        cache.clone(),
-        url.to_string(),
-        headers.clone(),
-        &fetch,
-        0,
-        cache.total,
-        None,
-        None,
-    );
-    let mut done = Vec::new();
-    for &off in offsets {
-        if off >= cache.total {
-            break;
-        }
-        if reader.prewarm(off).is_ok() {
-            done.push(file_piece_index(off));
-        }
-    }
-    done
-}
-
-/// Pieces currently warming in detached threads, by cache dir and index.
-/// Dedupes overlapping readahead; entries are removed on completion.
-static READAHEAD_INFLIGHT: std::sync::LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// Background warm of the pieces around a file seek target: the target
-/// piece plus two ahead. Detached thread, epoch-guarded: a newer seek
-/// abandons stale work before fetching. Piece bytes are content-addressed
-/// by offset, so a stale warm can only waste bandwidth, never corrupt.
-pub(crate) fn prefetch_file_around(state: &Arc<Mutex<ProxyState>>, seg: usize) {
-    let (epoch, total, src, headers) = match state.try_lock() {
-        Ok(st) => match (st.total_bytes, st.source.clone()) {
-            (Some(total), Some(src)) if total > 0 => {
-                let mut h = st.headers.clone();
-                h.retain(|k, _| !k.eq_ignore_ascii_case("range"));
-                (st.fetch_epoch, total, src, h)
-            }
-            _ => return,
-        },
-        Err(_) => return,
-    };
-    let fetch_url = crate::urls::strip_range_query(&src);
-    let state = state.clone();
-    thread::spawn(move || {
-        let Some(cache) = FileCache::open(&src, total, None) else {
-            return;
-        };
-        // A newer seek may have landed between snapshot and warm: skip.
-        if state
-            .try_lock()
-            .map(|st| st.fetch_epoch != epoch)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        let center = (seg as u64).saturating_mul(total) / FILE_CHUNKS as u64;
-        let mut offsets = Vec::new();
-        for k in 0..3u64 {
-            let off = center.saturating_add(k.saturating_mul(FILE_PIECE));
-            if off < total {
-                offsets.push(off);
-            }
-        }
-        for idx in warm_pieces(&cache, &fetch_url, &headers, fetch_piece_to_file, &offsets) {
-            record_piece_cell(&state, total, idx);
-        }
-    });
-}
-
-fn other_err(e: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
-
-impl<F> std::io::Read for CacheReader<F>
-where
-    F: Fn(
-        &str,
-        &HashMap<String, String>,
-        u64,
-        u64,
-        &Path,
-    ) -> std::result::Result<(), String>,
-{
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            if let Some((f, rem)) = self.cur.as_mut() {
-                if *rem == 0 {
-                    self.cur = None;
-                    continue;
-                }
-                let want = buf.len().min(*rem as usize);
-                let n = f.read(&mut buf[..want])?;
-                if n == 0 {
-                    return Err(other_err("play: cache piece truncated"));
-                }
-                self.cursor += n as u64;
-                *rem -= n as u64;
-                return Ok(n);
-            }
-            if self.cursor >= self.end {
-                return Ok(0);
-            }
-            let idx = file_piece_index(self.cursor);
-            let was_miss = !piece_complete(&self.cache, idx);
-            let mut f = self.ensure_piece(idx)?;
-            if was_miss {
-                if let Some(cb) = &self.on_miss {
-                    cb(idx);
-                }
-            }
-            let (pstart, plen) = file_piece_span(self.cache.total, idx);
-            let skip = self.cursor.saturating_sub(pstart);
-            if skip > 0 {
-                f.seek(std::io::SeekFrom::Start(skip)).map_err(other_err)?;
-            }
-            let remain = (pstart + plen).min(self.end).saturating_sub(self.cursor);
-            self.cur = Some((f, remain));
-        }
-    }
-}
-
 fn stream_file(
     request: tiny_http::Request,
     src: &str,
@@ -1588,154 +1150,9 @@ fn stream_file(
         .find(|h| h.field.equiv("Range"))
         .map(|h| h.value.as_str().to_string());
     let fetch = crate::urls::strip_range_query(src);
-    // Read-through extent cache: a previous request already revealed the
-    // total, so serve from disk (fetching misses) with no curl child.
-    // Any failure falls through to streaming below.
-    if !is_head {
-        if let Some(total) = state.try_lock().ok().and_then(|st| st.total_bytes) {
-            if let Some((start, end)) = parse_request_span(range.as_deref(), total) {
-                if let Some(cache) = FileCache::open(src, total, None) {
-                    let mut piece_headers = headers.clone();
-                    piece_headers.retain(|k, _| !k.eq_ignore_ascii_case("range"));
-                    // Grid callback: every disk-complete piece lights its
-                    // cells, so green means on disk like cached HLS.
-                    let on_cached: Arc<dyn Fn(u64) + Send + Sync> = {
-                        let state = state.clone();
-                        Arc::new(move |idx: u64| {
-                            if let Some(total) = state.try_lock().ok().and_then(|st| st.total_bytes)
-                            {
-                                record_piece_cell(&state, total, idx);
-                            }
-                        })
-                    };
-                    // Miss readahead: on each miss, warm the next two pieces
-                    // in a detached thread. An in-flight set dedupes overlap;
-                    // warmed fetches never cascade (they fetch directly).
-                    // Warmed pieces light the grid through the same callback.
-                    let readahead: Arc<dyn Fn(u64) + Send + Sync> = {
-                        let cache = cache.clone();
-                        let url = fetch.clone();
-                        let hdrs = piece_headers.clone();
-                        let cached_cb = on_cached.clone();
-                        Arc::new(move |idx: u64| {
-                            let mut want = Vec::new();
-                            if let Ok(mut busy) = READAHEAD_INFLIGHT.try_lock() {
-                                for n in [idx + 1, idx + 2] {
-                                    let (_, plen) = file_piece_span(cache.total, n);
-                                    if plen == 0 || piece_complete(&cache, n) {
-                                        continue;
-                                    }
-                                    if busy.insert((cache.dir.clone(), n)) {
-                                        want.push(n);
-                                    }
-                                }
-                            }
-                            for n in want {
-                                let cache = cache.clone();
-                                let url = url.clone();
-                                let hdrs = hdrs.clone();
-                                let cached_cb = cached_cb.clone();
-                                thread::spawn(move || {
-                                    let (pstart, plen) = file_piece_span(cache.total, n);
-                                    let tmp = cache.dir.join(format!(
-                                        ".tmp-{}-{}",
-                                        std::process::id(),
-                                        PIECE_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-                                    ));
-                                    match fetch_piece_to_file(&url, &hdrs, pstart, plen, &tmp) {
-                                        Ok(()) => {
-                                            if fs::rename(&tmp, &cache.part_path(n)).is_ok() {
-                                                cached_cb(n);
-                                            } else {
-                                                let _ = fs::remove_file(&tmp);
-                                            }
-                                        }
-                                        Err(_) => {
-                                            let _ = fs::remove_file(&tmp);
-                                        }
-                                    }
-                                    if let Ok(mut busy) = READAHEAD_INFLIGHT.try_lock() {
-                                        busy.remove(&(cache.dir.clone(), n));
-                                    }
-                                });
-                            }
-                        })
-                    };
-                    let reader = CacheReader::new(
-                        cache.clone(),
-                        fetch.clone(),
-                        piece_headers,
-                        fetch_piece_to_file,
-                        start,
-                        end,
-                        Some(readahead),
-                        Some(on_cached),
-                    );
-                    // Best-effort gate: prove the upstream serves ranges
-                    // before VLC depends on it. A miss falls through to
-                    // streaming below, so a range-ignoring or dead upstream
-                    // can never truncate playback mid-body.
-                    let cache_ready = match reader.prewarm(start) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            proxy_log(
-                                state,
-                                "error",
-                                format!("file cache unavailable ({e}), streaming"),
-                            );
-                            false
-                        }
-                    };
-                    if cache_ready {
-                        let counter = ServeCounter {
-                            inner: reader,
-                            state: state.clone(),
-                            span: Some((start, Some(total))),
-                            delivered: 0,
-                            marked: 0,
-                        };
-                        // Best-effort pre-mark: never stall the first byte.
-                        if let Ok(mut st) = state.try_lock() {
-                            st.served_cur_byte = Some(start);
-                            st.served_count += 1;
-                        }
-                        let mut resp_hdrs = vec![
-                            Header::from_bytes(&b"Content-Type"[..], cache.ctype.as_bytes())
-                                .unwrap_or_else(|_| {
-                                    Header::from_bytes(&b"Content-Type"[..], &b"video/mp4"[..])
-                                        .unwrap()
-                                }),
-                            Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
-                            Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..])
-                                .unwrap(),
-                        ];
-                        let code = if start == 0 && end == total {
-                            StatusCode(200)
-                        } else {
-                            resp_hdrs.push(
-                                Header::from_bytes(
-                                    &b"Content-Range"[..],
-                                    format!("bytes {}-{}/{}", start, end - 1, total).as_bytes(),
-                                )
-                                .unwrap(),
-                            );
-                            StatusCode(206)
-                        };
-                        let resp = Response::new(
-                            code,
-                            resp_hdrs,
-                            counter,
-                            Some((end - start) as usize),
-                            None,
-                        );
-                        let _ = request.respond(resp);
-                        note_fetch_ok(state, 0);
-                        return;
-                    }
-                }
-            }
-        }
-    }
+    // Progressive files always stream straight through curl: VLC
+    // reads each span once, so first-byte latency beats any disk
+    // cache. Served spans still mark progress (see ServeCounter).
     let n = std::process::id();
     let dir = std::env::temp_dir().join(format!(
         "play-proxy-{}-{}",
@@ -1779,21 +1196,50 @@ fn stream_file(
     }
     curl_push_url(&mut cmd, &fetch);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            let _ = fs::remove_dir_all(&dir);
-            note_fetch_err(state, format!("file {src} → curl spawn failed"));
-            let _ = request.respond(Response::from_string("curl").with_status_code(502));
-            return;
+    // One transparent retry on throttling/overload codes: a lone 429 /
+    // 502 / 503 / 504 must not fail playback when the next attempt
+    // succeeds. The `-D` header file is overwritten per attempt.
+    let mut attempt = 0;
+    let (code, ctype, clen, crange, mut child, pid) = loop {
+        attempt += 1;
+        let mut spawned = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&dir);
+                note_fetch_err(state, format!("file {src} → curl spawn failed"));
+                let _ = request.respond(Response::from_string("curl").with_status_code(502));
+                return;
+            }
+        };
+        let attempt_pid = spawned.id();
+        if let Some(hook) = current_cancel() {
+            hook.track(attempt_pid);
         }
+        let hdr_text = wait_http_headers(&hdr_path, Duration::from_secs(20));
+        let (code, ctype, clen, crange) = parse_upstream_headers(&hdr_text);
+        let retryable = matches!(code, 429 | 502 | 503 | 504);
+        if !(200..300).contains(&code) && retryable && attempt == 1 {
+            if let Some(hook) = current_cancel() {
+                hook.untrack(attempt_pid);
+            }
+            let _ = spawned.kill();
+            let _ = spawned.wait();
+            if current_cancel().is_some_and(|c| c.is_cancelled()) {
+                let _ = fs::remove_dir_all(&dir);
+                let msg = format!("file {src} → HTTP {code}");
+                note_fetch_err(state, msg.clone());
+                proxy_log(state, "error", msg);
+                let _ =
+                    request.respond(Response::from_string(format!("upstream {code}"))
+                        .with_status_code(code));
+                return;
+            }
+            proxy_log(state, "error", format!("file {src} → HTTP {code}, retrying once"));
+            thread::sleep(Duration::from_millis(1500));
+            continue;
+        }
+        break (code, ctype, clen, crange, spawned, attempt_pid);
     };
-    let pid = child.id();
-    if let Some(hook) = current_cancel() {
-        hook.track(pid);
-    }
-    let hdr_text = wait_http_headers(&hdr_path, Duration::from_secs(20));
-    let (code, ctype, clen, crange) = parse_upstream_headers(&hdr_text);
     if !(200..300).contains(&code) {
         if let Some(hook) = current_cancel() {
             hook.untrack(pid);
@@ -1834,6 +1280,9 @@ fn stream_file(
         .unwrap_or_else(|_| Header::from_bytes(&b"Content-Type"[..], &b"video/mp4"[..]).unwrap()),
         Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
         Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
+        // Giant responses must not hold the connection: a seek reuses a
+        // fresh socket instead of queueing behind an abandoned pump.
+        Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
     ];
     if let Some(cr) = crange.as_ref() {
         if !is_head {
@@ -1880,12 +1329,6 @@ fn stream_file(
             }
             st.served_cur_byte = Some(start);
             st.served_count += 1;
-        }
-        if let Some(t) = total {
-            // Seed the extent cache (dir + content-type marker) so later
-            // requests serve from disk. Best-effort, outside the guard:
-            // pruning walks the fs and must never stall polls.
-            let _ = FileCache::open(src, t, Some(&ctype));
         }
     }
     let counter = ServeCounter {
@@ -2197,55 +1640,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_record_piece_cell_maps_piece_bytes_to_cells() {
-        let state = blank_state(Vec::new(), 0);
-        // Unknown size: nothing honest to display.
-        record_piece_cell(&state, 0, 3);
-        assert!(state.lock().unwrap().cached_cells.iter().all(|&c| !c));
-        // 100 pieces of 1 MiB: piece 50 lights cell 50 alone.
-        let total = 100 * FILE_PIECE;
-        record_piece_cell(&state, total, 50);
-        let cells = state.lock().unwrap().cached_cells;
-        assert!(cells[50]);
-        assert!(!cells[49]);
-        assert!(!cells[51]);
-        // A piece spanning the whole small file lights every cell.
-        let small = blank_state(Vec::new(), 0);
-        record_piece_cell(&small, 2000, 0);
-        assert!(small.lock().unwrap().cached_cells.iter().all(|&c| c));
-        // A trailing `moov` probe piece lights nothing: seeking the last
-        // cell lands at its first byte, which lives in an earlier piece.
-        let total = 1485 * FILE_PIECE;
-        let moov = blank_state(Vec::new(), 0);
-        record_piece_cell(&moov, total, 1484);
-        {
-            let cells = moov.lock().unwrap().cached_cells;
-            assert!(!cells[FILE_CHUNKS - 1]);
-            assert!(!cells[50]);
-        }
-        // The piece holding the last cell's first byte lights it.
-        let first_idx = (99 * total / 100) / FILE_PIECE;
-        record_piece_cell(&moov, total, first_idx);
-        {
-            let cells = moov.lock().unwrap().cached_cells;
-            assert!(cells[FILE_CHUNKS - 1]);
-            assert!(!cells[50]);
-        }
-        // Past-the-end piece: nothing to fetch, nothing lit.
-        record_piece_cell(&small, 2000, 5);
-        assert_eq!(
-            small
-                .lock()
-                .unwrap()
-                .cached_cells
-                .iter()
-                .filter(|&&c| c)
-                .count(),
-            FILE_CHUNKS
-        );
-    }
-
-    #[test]
     fn test_resolve_serve_span_parses_ranges() {
         // Explicit range keeps its span; total stays unknown.
         assert_eq!(
@@ -2267,330 +1661,6 @@ pub(crate) mod tests {
         // Backwards and garbage spans are skipped, not displayed.
         assert_eq!(resolve_serve_span(Some("bytes=100-50"), 206, None, None), None);
         assert_eq!(resolve_serve_span(Some("bytes=nope"), 206, None, None), None);
-    }
-
-    #[test]
-    fn test_file_cache_key_survives_token_rotation() {
-        let a = "https://e1.cdn.example/v0d3ur3l/s0m3v1d30~AbC123?token=t0k3n000000000000000001&expiry=1000000000001";
-        let b = "https://e1.cdn.example/v0d3ur3l/s0m3v1d30~OTHERsig?token=t0k3n000000000000000002&expiry=1000000000002";
-        // Rotated query token and ~signature tail: same content, same key.
-        assert_eq!(file_cache_key(a), file_cache_key(b));
-        assert_eq!(file_cache_key(a).len(), 16);
-        // Different content path: different key.
-        let c = "https://e1.cdn.example/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/different~sig?token=x&expiry=1";
-        assert_ne!(file_cache_key(a), file_cache_key(c));
-    }
-
-    #[test]
-    fn test_file_piece_math() {
-        assert_eq!(file_piece_index(0), 0);
-        assert_eq!(file_piece_index(FILE_PIECE - 1), 0);
-        assert_eq!(file_piece_index(FILE_PIECE), 1);
-        // Full piece then a short tail.
-        assert_eq!(file_piece_span(3 * FILE_PIECE, 1), (FILE_PIECE, FILE_PIECE));
-        assert_eq!(file_piece_span(2 * FILE_PIECE + 7, 2), (2 * FILE_PIECE, 7));
-    }
-
-    #[test]
-    fn test_parse_request_span_clamps() {
-        assert_eq!(parse_request_span(Some("bytes=100-199"), 1000), Some((100, 200)));
-        assert_eq!(parse_request_span(Some("bytes=100-"), 1000), Some((100, 1000)));
-        // Past-the-end clamps into range; start past total is unservable.
-        assert_eq!(parse_request_span(Some("bytes=900-9999"), 1000), Some((900, 1000)));
-        assert_eq!(parse_request_span(Some("bytes=1000-"), 1000), None);
-        assert_eq!(parse_request_span(None, 1000), Some((0, 1000)));
-        assert_eq!(parse_request_span(Some("bytes=nope"), 1000), None);
-        assert_eq!(parse_request_span(Some("bytes=0-99"), 0), None);
-    }
-
-    #[test]
-    fn test_dirs_to_prune_keeps_live_and_newest() {
-        use std::time::{Duration, UNIX_EPOCH};
-        let t = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
-        let live = PathBuf::from("/c/live");
-        let entries = vec![
-            (PathBuf::from("/c/old"), t(1)),
-            (live.clone(), t(2)),
-            (PathBuf::from("/c/new"), t(3)),
-        ];
-        // Cap 2: live plus newest survive; oldest drops.
-        assert_eq!(
-            dirs_to_prune(entries, &live, 2),
-            vec![PathBuf::from("/c/old")]
-        );
-    }
-
-    #[test]
-    fn test_cache_reader_serves_hits_without_refetch() {
-        use std::cell::Cell;
-        use std::io::Read;
-        use std::rc::Rc;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCache {
-            dir: dir.path().to_path_buf(),
-            total: 2 * FILE_PIECE + 10,
-            ctype: "video/mp4".to_string(),
-        };
-        let calls = Rc::new(Cell::new(0u32));
-        let fill = {
-            let calls = calls.clone();
-            move |_url: &str, _hd: &HashMap<String, String>, start: u64, len: u64, dest: &Path| {
-                calls.set(calls.get() + 1);
-                // Deterministic content: byte value = piece index.
-                let v = (start / FILE_PIECE) as u8;
-                fs::write(dest, vec![v; len as usize]).map(|_| ()).map_err(|e| e.to_string())
-            }
-        };
-        // Span crossing three pieces: two full, one 10-byte tail.
-        let span_start = FILE_PIECE - 5;
-        let span_end = 2 * FILE_PIECE + 10;
-        let mut out = Vec::new();
-        CacheReader::new(
-            cache.clone(),
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fill,
-            span_start,
-            span_end,
-            None,
-            None,
-        )
-        .read_to_end(&mut out)
-        .unwrap();
-        assert_eq!(out.len() as u64, span_end - span_start);
-        assert_eq!(calls.get(), 3);
-        assert_eq!(&out[..5], &[0u8; 5]);
-        assert_eq!(&out[5..5 + FILE_PIECE as usize], &vec![1u8; FILE_PIECE as usize][..]);
-        // Identical second pass: all hits, no refetch.
-        let fill2 = {
-            let calls = calls.clone();
-            move |_url: &str, _hd: &HashMap<String, String>, _s: u64, _l: u64, _d: &Path| {
-                calls.set(calls.get() + 1);
-                Err("must not refetch".to_string())
-            }
-        };
-        let mut out2 = Vec::new();
-        CacheReader::new(
-            cache,
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fill2,
-            span_start,
-            span_end,
-            None,
-            None,
-        )
-        .read_to_end(&mut out2)
-        .unwrap();
-        assert_eq!(out2, out);
-        assert_eq!(calls.get(), 3);
-    }
-
-    #[test]
-    fn test_cache_reader_prewarm_fetches_first_piece_only() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCache {
-            dir: dir.path().to_path_buf(),
-            total: 3 * FILE_PIECE,
-            ctype: "video/mp4".to_string(),
-        };
-        let calls = Rc::new(Cell::new(0u32));
-        let fill = {
-            let calls = calls.clone();
-            move |_url: &str,
-                  _hd: &HashMap<String, String>,
-                  _s: u64,
-                  len: u64,
-                  dest: &Path| {
-                calls.set(calls.get() + 1);
-                fs::write(dest, vec![9u8; len as usize])
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
-        };
-        let reader = CacheReader::new(
-            cache,
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fill,
-            FILE_PIECE + 7,
-            2 * FILE_PIECE,
-            None,
-            None,
-        );
-        reader.prewarm(FILE_PIECE + 7).unwrap();
-        assert_eq!(calls.get(), 1);
-        // Second prewarm is a hit: no refetch.
-        reader.prewarm(FILE_PIECE + 7).unwrap();
-        assert_eq!(calls.get(), 1);
-    }
-
-    #[test]
-    fn test_cache_reader_prewarm_reports_fetch_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCache {
-            dir: dir.path().to_path_buf(),
-            total: 3 * FILE_PIECE,
-            ctype: "video/mp4".to_string(),
-        };
-        let fail =
-            |_url: &str, _hd: &HashMap<String, String>, _s: u64, _l: u64, _d: &Path| {
-                Err("upstream 403".to_string())
-            };
-        let reader = CacheReader::new(
-            cache,
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fail,
-            0,
-            FILE_PIECE,
-            None,
-            None,
-        );
-        // The serve path treats this as streaming fallback, never truncation.
-        assert!(reader.prewarm(0).is_err());
-    }
-
-    #[test]
-    fn test_cache_reader_miss_callback_fires_once_per_miss() {
-        use std::cell::Cell;
-        use std::io::Read;
-        use std::rc::Rc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCache {
-            dir: dir.path().to_path_buf(),
-            total: 2 * FILE_PIECE + 10,
-            ctype: "video/mp4".to_string(),
-        };
-        let fired = Arc::new(AtomicU64::new(0));
-        let on_miss = {
-            let fired = fired.clone();
-            let cb: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |_idx: u64| {
-                fired.fetch_add(1, Ordering::SeqCst);
-            });
-            cb
-        };
-        let calls = Rc::new(Cell::new(0u32));
-        let fill = {
-            let calls = calls.clone();
-            move |_url: &str, _hd: &HashMap<String, String>, _s: u64, len: u64, dest: &Path| {
-                calls.set(calls.get() + 1);
-                fs::write(dest, vec![3u8; len as usize]).map(|_| ()).map_err(|e| e.to_string())
-            }
-        };
-        // Span crossing three pieces: three misses, three callbacks.
-        let mut out = Vec::new();
-        CacheReader::new(
-            cache,
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fill,
-            FILE_PIECE - 5,
-            2 * FILE_PIECE + 10,
-            Some(on_miss),
-            None,
-        )
-        .read_to_end(&mut out)
-        .unwrap();
-        assert_eq!(calls.get(), 3);
-        assert_eq!(fired.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn test_warm_pieces_writes_missing_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCache {
-            dir: dir.path().to_path_buf(),
-            total: 3 * FILE_PIECE,
-            ctype: "video/mp4".to_string(),
-        };
-        use std::cell::Cell;
-        use std::rc::Rc;
-        let calls = Rc::new(Cell::new(0u32));
-        let fill = {
-            let calls = calls.clone();
-            move |_url: &str, _hd: &HashMap<String, String>, _s: u64, len: u64, dest: &Path| {
-                calls.set(calls.get() + 1);
-                fs::write(dest, vec![5u8; len as usize]).map(|_| ()).map_err(|e| e.to_string())
-            }
-        };
-        let done =
-            warm_pieces(&cache, "https://cdn.example/f", &HashMap::new(), &fill, &[0, FILE_PIECE]);
-        assert_eq!(done, vec![0, 1]);
-        assert_eq!(calls.get(), 2);
-        assert!(piece_complete(&cache, 0));
-        assert!(piece_complete(&cache, 1));
-        assert!(!piece_complete(&cache, 2));
-        // Second warm is all hits: no refetch, stops past the total.
-        let done = warm_pieces(
-            &cache,
-            "https://cdn.example/f",
-            &HashMap::new(),
-            &fill,
-            &[0, FILE_PIECE, 2 * FILE_PIECE, 3 * FILE_PIECE],
-        );
-        assert_eq!(done, vec![0, 1, 2]);
-        assert_eq!(calls.get(), 3);
-        assert!(piece_complete(&cache, 2));
-    }
-
-    #[test]
-    fn test_cache_reader_cached_callback_fires_on_hit_and_miss() {
-        use std::io::Read;
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FileCache {
-            dir: dir.path().to_path_buf(),
-            total: 2 * FILE_PIECE + 10,
-            ctype: "video/mp4".to_string(),
-        };
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let on_cached = {
-            let seen = seen.clone();
-            let cb: Arc<dyn Fn(u64) + Send + Sync> =
-                Arc::new(move |idx: u64| seen.lock().unwrap().push(idx));
-            cb
-        };
-        let fill =
-            move |_url: &str, _hd: &HashMap<String, String>, _s: u64, len: u64, dest: &Path| {
-                fs::write(dest, vec![3u8; len as usize]).map(|_| ()).map_err(|e| e.to_string())
-            };
-        // Three missing pieces report once each.
-        let mut out = Vec::new();
-        CacheReader::new(
-            cache.clone(),
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fill,
-            0,
-            2 * FILE_PIECE + 10,
-            None,
-            Some(on_cached.clone()),
-        )
-        .read_to_end(&mut out)
-        .unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
-        // Identical second pass is all hits: reports again, no refetch.
-        let fail = |_url: &str, _hd: &HashMap<String, String>, _s: u64, _l: u64, _d: &Path| {
-            Err("must not refetch".to_string())
-        };
-        let mut out2 = Vec::new();
-        CacheReader::new(
-            cache,
-            "https://cdn.example/f".to_string(),
-            HashMap::new(),
-            fail,
-            0,
-            2 * FILE_PIECE + 10,
-            None,
-            Some(on_cached),
-        )
-        .read_to_end(&mut out2)
-        .unwrap();
-        assert_eq!(out2, out);
-        assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 0, 1, 2]);
     }
 
     #[test]
@@ -2699,5 +1769,21 @@ pub(crate) mod tests {
         // Past-the-end offsets clamp to the final cell, never past it.
         assert_eq!(file_playhead_chunk(2000, 2000), Some(FILE_CHUNKS - 1));
         assert_eq!(file_playhead_chunk(2000, u64::MAX), Some(FILE_CHUNKS - 1));
+    }
+
+    #[test]
+    fn test_served_cells_maps_spans_to_grid() {
+        // Unknown total: nothing honest to display.
+        assert!(served_cells(0, &[(0, 100)]).iter().all(|&c| !c));
+        // 2000 bytes → 20-byte cells: span 140-160 lights cell 7 alone.
+        let cells = served_cells(2000, &[(140, 160)]);
+        assert!(cells[7]);
+        assert!(!cells[6]);
+        assert!(!cells[8]);
+        // Overlapping spans merge; empty spans are skipped.
+        let cells = served_cells(2000, &[(0, 20), (10, 40), (50, 50)]);
+        assert!(cells[0]);
+        assert!(cells[1]);
+        assert!(!cells[2]);
     }
 }
