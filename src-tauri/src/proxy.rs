@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,8 +63,11 @@ pub struct ProxyState {
     /// Readahead generation. Each serving trigger bumps it and passes the
     /// value to its fill thread; a thread whose epoch is stale (the user
     /// sought to a new window) stops before its next segment, so only the
-    /// current seek position +10% is fetched.
+    /// current seek position +window is fetched.
     pub fetch_epoch: u64,
+    /// Per-stream lookahead override, in percent of playlist. None means
+    /// the global default. Files ignore this (streaming, no lookahead).
+    pub lookahead_pct: Option<u8>,
     pub verbose: bool,
     pub source: Option<String>,
     pub on_log: Option<Arc<dyn Fn(&str, String) + Send + Sync>>,
@@ -559,6 +562,7 @@ pub fn start_proxy(
         last_error: None,
         recent: VecDeque::new(),
         fetch_epoch: 0,
+        lookahead_pct: None,
         verbose,
         source: None,
         on_log: None,
@@ -699,21 +703,22 @@ fn stop_flag(handle: &ProxyHandle) -> bool {
     handle.stop.load(Ordering::SeqCst)
 }
 
-/// After serving a segment, keep 10% of the whole playlist cached ahead
-/// of the current position. A 789-segment playlist keeps ~79 ahead from
-/// any seek point. Runs in the background; each request re-anchors the
-/// window at the latest segment VLC asked for, so seeks move the window.
+/// After serving a segment, keep the lookahead window cached ahead of the
+/// current position (global default 10%, per-stream overrides apply).
+/// Runs in the background; each request re-anchors the window at the
+/// latest segment VLC asked for, so seeks move the window.
 fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
-    let (segments, headers, start, total) = {
+    let (segments, headers, start, total, pct) = {
         let st = state.lock().unwrap();
         let total = st.segments.len();
         if total == 0 {
             return;
         }
         let start = st.served_cur.map_or(0, |c| c + 1);
-        (st.segments.clone(), st.headers.clone(), start, total)
+        let pct = effective_lookahead(st.lookahead_pct);
+        (st.segments.clone(), st.headers.clone(), start, total, pct)
     };
-    let want = readahead_window(total, start);
+    let want = readahead_window(total, start, pct);
     if want == 0 {
         return;
     }
@@ -740,14 +745,42 @@ fn trigger_readahead(state: Arc<Mutex<ProxyState>>, stop: Arc<AtomicBool>) {
     });
 }
 
-/// Segments to keep cached ahead: 10% of the whole playlist from the
+/// Lookahead bounds, in percent of playlist. The global default lives in
+/// app config (Settings tab); streams may override it individually.
+pub(crate) const LOOKAHEAD_MIN: u8 = 10;
+pub(crate) const LOOKAHEAD_MAX: u8 = 50;
+pub(crate) const LOOKAHEAD_DEFAULT: u8 = 10;
+
+/// Process-wide lookahead default. Initialized from app config at startup
+/// and updated by the settings command; proxy threads (which only hold
+/// ProxyState) read it when no per-stream override is set.
+static LOOKAHEAD_DEFAULT_PCT: AtomicU8 = AtomicU8::new(LOOKAHEAD_DEFAULT);
+
+pub(crate) fn clamp_lookahead(pct: u8) -> u8 {
+    pct.clamp(LOOKAHEAD_MIN, LOOKAHEAD_MAX)
+}
+
+pub(crate) fn lookahead_default() -> u8 {
+    LOOKAHEAD_DEFAULT_PCT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_lookahead_default(pct: u8) {
+    LOOKAHEAD_DEFAULT_PCT.store(clamp_lookahead(pct), Ordering::Relaxed);
+}
+
+/// Effective lookahead for a session: its override, else the global.
+pub(crate) fn effective_lookahead(override_pct: Option<u8>) -> u8 {
+    override_pct.map(clamp_lookahead).unwrap_or_else(lookahead_default)
+}
+
+/// Segments to keep cached ahead: `pct` of the whole playlist from the
 /// playhead, capped by what remains. At least 1 while anything remains.
-pub(crate) fn readahead_window(total: usize, start: usize) -> usize {
+pub(crate) fn readahead_window(total: usize, start: usize, pct: u8) -> usize {
     let remaining = total.saturating_sub(start);
     if remaining == 0 {
         return 0;
     }
-    (total / 10).max(1).min(remaining)
+    ((total as u64 * pct as u64 / 100).max(1) as usize).min(remaining)
 }
 
 /// Download [start, start+count) into the cache. Skips cached entries,
@@ -1411,14 +1444,33 @@ pub(crate) mod tests {
     #[test]
     fn test_readahead_window_is_ten_percent() {
         // 789-segment playlist keeps ~79 ahead from any seek point.
-        assert_eq!(readahead_window(789, 0), 78);
-        assert_eq!(readahead_window(789, 400), 78);
+        assert_eq!(readahead_window(789, 0, 10), 78);
+        assert_eq!(readahead_window(789, 400, 10), 78);
         // Capped by what remains near the end.
-        assert_eq!(readahead_window(789, 780), 9);
-        assert_eq!(readahead_window(100, 90), 10);
-        assert_eq!(readahead_window(5, 0), 1);
-        assert_eq!(readahead_window(10, 10), 0);
-        assert_eq!(readahead_window(0, 0), 0);
+        assert_eq!(readahead_window(789, 780, 10), 9);
+        assert_eq!(readahead_window(100, 90, 10), 10);
+        assert_eq!(readahead_window(5, 0, 10), 1);
+        assert_eq!(readahead_window(10, 10, 10), 0);
+        assert_eq!(readahead_window(0, 0, 10), 0);
+        // Higher settings scale the window; the cap still wins.
+        assert_eq!(readahead_window(789, 0, 50), 394);
+        assert_eq!(readahead_window(789, 780, 50), 9);
+    }
+
+    #[test]
+    fn test_lookahead_clamp_and_effective() {
+        assert_eq!(clamp_lookahead(0), LOOKAHEAD_MIN);
+        assert_eq!(clamp_lookahead(9), LOOKAHEAD_MIN);
+        assert_eq!(clamp_lookahead(10), 10);
+        assert_eq!(clamp_lookahead(50), 50);
+        assert_eq!(clamp_lookahead(51), LOOKAHEAD_MAX);
+        assert_eq!(clamp_lookahead(255), LOOKAHEAD_MAX);
+        // No override inherits the global; an override wins, clamped.
+        set_lookahead_default(LOOKAHEAD_DEFAULT);
+        assert_eq!(effective_lookahead(None), LOOKAHEAD_DEFAULT);
+        assert_eq!(effective_lookahead(Some(30)), 30);
+        assert_eq!(effective_lookahead(Some(99)), LOOKAHEAD_MAX);
+        set_lookahead_default(LOOKAHEAD_DEFAULT);
     }
 
     #[test]
@@ -1470,6 +1522,7 @@ pub(crate) mod tests {
             last_error: None,
             recent: VecDeque::new(),
             fetch_epoch: epoch,
+            lookahead_pct: None,
             verbose: false,
             source: None,
             on_log: None,

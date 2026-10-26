@@ -20,6 +20,7 @@ pub fn run() {
         .setup(|app| {
             capture::start(app.handle().clone());
             commands::spawn_wedge_watchdog(app.handle());
+            commands::init_lookahead_default(app.handle());
             let handle = app.handle().clone();
             use tauri_plugin_deep_link::DeepLinkExt;
             app.deep_link().on_open_url(move |event| {
@@ -42,6 +43,9 @@ pub fn run() {
             commands::resolve_cmd,
             commands::play_cmd,
             commands::cancel_op_cmd,
+            commands::get_lookahead_cmd,
+            commands::set_lookahead_cmd,
+            commands::set_stream_lookahead_cmd,
             commands::stop_cmd,
             commands::list_streams_cmd,
             commands::stop_stream_cmd,

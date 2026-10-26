@@ -40,6 +40,7 @@ use crate::urls::{
 struct GuiConfig {
     workdir: Option<String>,
     workers: Option<u32>,
+    lookahead: Option<u8>,
 }
 
 pub struct AppState {
@@ -134,6 +135,10 @@ pub struct StreamDto {
     pub total: usize,
     pub cached_bytes: u64,
     pub served: u64,
+    /// Effective lookahead percent for this session (override or global).
+    pub lookahead: u8,
+    /// Per-stream override, if set (None inherits the global).
+    pub lookahead_override: Option<u8>,
 }
 
 /// Owned session facts safe to carry past the streams guard: proxy state by
@@ -240,6 +245,9 @@ fn file_session_dto(snap: &StreamSnap, now: u64) -> Option<StreamDto> {
         total: crate::proxy::FILE_CHUNKS,
         cached_bytes: st.cached_bytes,
         served: st.served_count,
+        // Files stream without lookahead; the override control is HLS-only.
+        lookahead: crate::proxy::lookahead_default(),
+        lookahead_override: None,
     })
 }
 
@@ -248,11 +256,13 @@ fn dto_from_snap(snap: &StreamSnap) -> Option<StreamDto> {
     if proxy_guard(snap).is_some_and(|st| st.source.is_some()) {
         return file_session_dto(snap, now);
     }
-    let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served) =
+    let (playhead, buffered, window, window_start, window_len, total, cached_bytes, served, lookahead, lookahead_override) =
         match &snap.proxy_state {
             Some(_) => {
                 let st = proxy_guard(snap)?;
                 let total = st.segments.len();
+                let lookahead_override = st.lookahead_pct;
+                let lookahead = crate::proxy::effective_lookahead(lookahead_override);
                 let playhead = st.served_cur;
                 // Contiguous cached run ahead of the playhead. Sparse
                 // entries past a gap do not count: VLC cannot play them yet.
@@ -265,11 +275,11 @@ fn dto_from_snap(snap: &StreamSnap) -> Option<StreamDto> {
                         break;
                     }
                 }
-                // Next 10% window after the playhead, sampled into 20
-                // pieces (0.5% each). A piece is filled when any segment
-                // in its slice is cached. Gaps stay visible until the
+                // Next lookahead window after the playhead, sampled
+                // into 20 pieces. A piece is filled when any segment in
+                // its slice is cached. Gaps stay visible until the
                 // fetcher fills them in order.
-                let want = crate::proxy::readahead_window(total, start);
+                let want = crate::proxy::readahead_window(total, start, lookahead);
                 let window_start = (want > 0).then_some(start);
                 let mut window = Vec::new();
                 for i in 0..20 {
@@ -286,9 +296,11 @@ fn dto_from_snap(snap: &StreamSnap) -> Option<StreamDto> {
                     total,
                     st.cached_bytes,
                     st.served_count,
+                    lookahead,
+                    lookahead_override,
                 )
             }
-            None => (None, 0, Vec::new(), None, 0, 0, 0, 0),
+            None => (None, 0, Vec::new(), None, 0, 0, 0, 0, crate::proxy::lookahead_default(), None),
         };
     let (port, fetch_status, speed_bps, fetched_bytes, last_error, cached) =
         match &snap.proxy_state {
@@ -340,7 +352,42 @@ fn dto_from_snap(snap: &StreamSnap) -> Option<StreamDto> {
         total,
         cached_bytes,
         served,
+        lookahead,
+        lookahead_override,
     })
+}
+
+/// Per-stream lookahead override (percent, clamped 10-50) or None to
+/// inherit the global. Takes effect on the next served segment, which
+/// re-anchors the window; files ignore it (streaming, no lookahead).
+#[tauri::command]
+pub fn set_stream_lookahead_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: u64,
+    pct: Option<u8>,
+) -> Result<StreamDto, String> {
+    let pct = pct.map(crate::proxy::clamp_lookahead);
+    let proxy_state = {
+        let streams = state.streams.lock(StreamsSite::Patch);
+        streams
+            .get(&id)
+            .and_then(|s| s.proxy.as_ref().map(|p| p.state.clone()))
+            .ok_or_else(|| format!("play: no stream {id}"))?
+    };
+    proxy_state
+        .try_lock()
+        .map(|mut pst| pst.lookahead_pct = pct)
+        .map_err(|_| format!("play: proxy busy, retrying lookahead {id}"))?;
+    log(
+        &app,
+        "info",
+        format!(
+            "stream {id} lookahead {}",
+            pct.map_or("global".to_string(), |p| format!("{p}%"))
+        ),
+    );
+    patch_stream(&app, id, |_| {}).ok_or_else(|| format!("play: no stream {id}"))
 }
 
 fn emit_stream(app: &AppHandle, dto: &StreamDto) {
@@ -971,6 +1018,47 @@ pub fn set_workdir_cmd(
         cfg.workdir = Some(p.to_string_lossy().into_owned());
     });
     Ok(p.to_string_lossy().into_owned())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LookaheadDto {
+    pub lookahead: u8,
+    pub min_lookahead: u8,
+    pub max_lookahead: u8,
+}
+
+fn lookahead_dto() -> LookaheadDto {
+    LookaheadDto {
+        lookahead: crate::proxy::lookahead_default(),
+        min_lookahead: crate::proxy::LOOKAHEAD_MIN,
+        max_lookahead: crate::proxy::LOOKAHEAD_MAX,
+    }
+}
+
+/// Load the persisted global into the process default. Called once at
+/// startup; later updates go through `set_lookahead_cmd`.
+pub(crate) fn init_lookahead_default(app: &AppHandle) {
+    let pct = load_gui_config(app)
+        .lookahead
+        .unwrap_or(crate::proxy::LOOKAHEAD_DEFAULT);
+    crate::proxy::set_lookahead_default(pct);
+}
+
+#[tauri::command]
+pub fn get_lookahead_cmd() -> LookaheadDto {
+    lookahead_dto()
+}
+
+#[tauri::command]
+pub fn set_lookahead_cmd(app: AppHandle, pct: u8) -> Result<LookaheadDto, String> {
+    let pct = crate::proxy::clamp_lookahead(pct);
+    crate::proxy::set_lookahead_default(pct);
+    patch_gui_config(&app, |cfg| {
+        cfg.lookahead = Some(pct);
+    });
+    log(&app, "info", format!("lookahead {pct}%"));
+    Ok(lookahead_dto())
 }
 
 #[tauri::command]
@@ -2447,6 +2535,39 @@ mod tests {
         let second = begin_op(&state);
         assert!(first.is_cancelled());
         assert!(!second.is_cancelled());
+    }
+
+    #[test]
+    fn test_hls_dto_reports_effective_lookahead() {
+        use std::sync::Arc;
+        let state = Arc::new(crate::proxy::tests::blank_state(
+            vec![
+                "https://cdn.example/s0.ts".to_string(),
+                "https://cdn.example/s1.ts".to_string(),
+            ],
+            0,
+        ));
+        let snap = StreamSnap {
+            id: 9,
+            url: "https://cdn.example/hls/index.m3u8".to_string(),
+            quality: "best".to_string(),
+            status: "playing".to_string(),
+            title: None,
+            play_url: "http://127.0.0.1:1/index.m3u8".to_string(),
+            pid: None,
+            proxy_state: Some(state.clone()),
+            proxy_base: None,
+        };
+        // Override wins and is reported.
+        state.lock().unwrap().lookahead_pct = Some(30);
+        let dto = dto_from_snap(&snap).expect("dto");
+        assert_eq!(dto.lookahead, 30);
+        assert_eq!(dto.lookahead_override, Some(30));
+        // Without override the global default is inherited.
+        state.lock().unwrap().lookahead_pct = None;
+        let dto = dto_from_snap(&snap).expect("dto");
+        assert_eq!(dto.lookahead, crate::proxy::lookahead_default());
+        assert_eq!(dto.lookahead_override, None);
     }
 
     #[test]
