@@ -3,10 +3,13 @@
 
   interface Props {
     streams: StreamSession[];
+    globalLookahead: number;
     onStopStream: (id: number) => void;
     onSeekStream: (id: number, seg: number) => void;
+    onLookahead: (id: number, pct: number | null) => void;
   }
-  let { streams, onStopStream, onSeekStream }: Props = $props();
+  let { streams, globalLookahead, onStopStream, onSeekStream, onLookahead }: Props =
+    $props();
 
   let expanded = $state<number[]>([]);
 
@@ -229,6 +232,44 @@
                           s.cachedBytes,
                         )} cached
                       </dd>
+                    </div>
+                    <div>
+                      <dt
+                        class="text-surface-500"
+                        title="HLS only; progressive files stream without lookahead"
+                        >Lookahead</dt
+                      >
+                      <dd class="font-mono text-surface-200">
+                        {s.lookaheadOverride ?? globalLookahead}%{s.lookaheadOverride !=
+                        null
+                          ? " · this stream"
+                          : " · global"}
+                      </dd>
+                      <div class="mt-1 flex items-center gap-2">
+                        <input
+                          class="w-full accent-accent-500"
+                          type="range"
+                          min="10"
+                          max="50"
+                          step="5"
+                          value={s.lookaheadOverride ?? globalLookahead}
+                          aria-label={`Lookahead for stream ${s.id}`}
+                          onchange={(e) =>
+                            onLookahead(
+                              s.id,
+                              Number((e.currentTarget as HTMLInputElement).value),
+                            )}
+                        />
+                        {#if s.lookaheadOverride != null}
+                          <button
+                            type="button"
+                            class="shrink-0 rounded-md px-2 py-0.5 text-[11px] text-accent-400 hover:underline"
+                            onclick={() => onLookahead(s.id, null)}
+                          >
+                            Global
+                          </button>
+                        {/if}
+                      </div>
                     </div>
                   </dl>
                   {#if s.lastError}

@@ -2,8 +2,20 @@
   interface Props {
     workdir: string;
     onPick: () => void;
+    lookahead: number;
+    minLookahead: number;
+    maxLookahead: number;
+    onLookahead: (n: number) => void;
   }
-  let { workdir, onPick }: Props = $props();
+  let { workdir, onPick, lookahead, minLookahead, maxLookahead, onLookahead }: Props =
+    $props();
+
+  function setLookahead(raw: number) {
+    const n =
+      Math.min(maxLookahead, Math.max(minLookahead, Math.round(Number(raw) / 5) * 5)) ||
+      minLookahead;
+    if (n !== lookahead) onLookahead(n);
+  }
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4">
@@ -29,5 +41,30 @@
         Choose…
       </button>
     </div>
+  </section>
+  <section class="rounded-xl border border-surface-800 bg-surface-900 p-4">
+    <h2 class="text-sm font-semibold">Lookahead</h2>
+    <p class="mt-1 text-[11px] leading-4 text-surface-500">
+      Playlist percent prefetched ahead of playback. Saved in app config;
+      every stream inherits it unless overridden in its detail.
+    </p>
+    <label
+      for="lookahead"
+      class="mt-2 flex items-center justify-between text-xs text-surface-300"
+    >
+      <span>Prefetch window</span>
+      <span class="font-mono">{lookahead}%</span>
+    </label>
+    <input
+      id="lookahead"
+      class="mt-2 w-full accent-accent-500"
+      type="range"
+      min={minLookahead}
+      max={maxLookahead}
+      step="5"
+      value={lookahead}
+      oninput={(e) =>
+        setLookahead(Number((e.currentTarget as HTMLInputElement).value))}
+    />
   </section>
 </div>

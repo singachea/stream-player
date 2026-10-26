@@ -80,6 +80,12 @@ export interface DownloadConfig {
   maxWorkers: number;
 }
 
+export interface LookaheadConfig {
+  lookahead: number;
+  minLookahead: number;
+  maxLookahead: number;
+}
+
 export interface Job {
   id: number;
   url: string;

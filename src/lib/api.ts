@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DownloadConfig, HostRow, Job, ResolveResponse } from "./types";
+import type {
+  DownloadConfig,
+  HostRow,
+  Job,
+  LookaheadConfig,
+  ResolveResponse,
+} from "./types";
 
 export type HeaderOpts = {
   referer?: string | null;
@@ -99,6 +105,21 @@ export function cancelOp(): Promise<void> {
   return invoke("cancel_op_cmd");
 }
 
+export function getLookahead(): Promise<LookaheadConfig> {
+  return invoke("get_lookahead_cmd");
+}
+
+export function setLookahead(pct: number): Promise<LookaheadConfig> {
+  return invoke("set_lookahead_cmd", { pct });
+}
+
+export function setStreamLookahead(
+  id: number,
+  pct: number | null,
+): Promise<StreamSession> {
+  return invoke("set_stream_lookahead_cmd", { id, pct });
+}
+
 export interface StreamSession {
   id: number;
   url: string;
@@ -122,6 +143,8 @@ export interface StreamSession {
   total: number;
   cachedBytes: number;
   served: number;
+  lookahead: number;
+  lookaheadOverride?: number | null;
 }
 
 export function listStreams(): Promise<StreamSession[]> {

@@ -10,6 +10,7 @@
     Job,
     LogFilter,
     LogLine,
+    LookaheadConfig,
     NeedReferer,
     Subtitle,
     Variant,
@@ -66,6 +67,11 @@
     workers: 6,
     minWorkers: 1,
     maxWorkers: 16,
+  });
+  let lookaheadCfg = $state<LookaheadConfig>({
+    lookahead: 10,
+    minLookahead: 10,
+    maxLookahead: 50,
   });
   const jobsActive = $derived(
     jobs.filter((j) =>
@@ -333,6 +339,7 @@
       workdir = await api.getWorkdir();
       hosts = await api.listHosts();
       dlConfig = await api.getDownloadConfig();
+      lookaheadCfg = await api.getLookahead();
       streams = await api.listStreams();
     } catch (e) {
       toastStore.push("error", String(e));
@@ -351,6 +358,29 @@
         (e) => toastStore.push("error", String(e)),
       );
     }, 200);
+  }
+
+  let lookaheadTimer: number | undefined;
+  function setLookahead(n: number) {
+    lookaheadCfg = { ...lookaheadCfg, lookahead: n };
+    window.clearTimeout(lookaheadTimer);
+    lookaheadTimer = window.setTimeout(() => {
+      void api.setLookahead(n).then(
+        (cfg) => {
+          lookaheadCfg = cfg;
+        },
+        (e) => toastStore.push("error", String(e)),
+      );
+    }, 200);
+  }
+
+  async function setStreamLookahead(id: number, pct: number | null) {
+    try {
+      const dto = await api.setStreamLookahead(id, pct);
+      streams = streams.map((x) => (x.id === id ? dto : x));
+    } catch (e) {
+      toastStore.push("error", String(e));
+    }
   }
 
   async function pickFolder() {
@@ -1151,8 +1181,10 @@
 
     <StreamProxies
       {streams}
+      globalLookahead={lookaheadCfg.lookahead}
       onStopStream={(id) => void stopStream(id)}
       onSeekStream={(id, seg) => void seekStream(id, seg)}
+      onLookahead={(id, pct) => void setStreamLookahead(id, pct)}
     />
 
     </div>
@@ -1185,7 +1217,14 @@
   </main>
   {:else}
   <main class="flex min-h-0 flex-1">
-    <SettingsPane {workdir} onPick={() => void pickFolder()} />
+    <SettingsPane
+      {workdir}
+      onPick={() => void pickFolder()}
+      lookahead={lookaheadCfg.lookahead}
+      minLookahead={lookaheadCfg.minLookahead}
+      maxLookahead={lookaheadCfg.maxLookahead}
+      onLookahead={(n) => void setLookahead(n)}
+    />
   </main>
   {/if}
 
